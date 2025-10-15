@@ -10,6 +10,7 @@ import asyncio
 import os
 import logging
 import time
+from pathlib import Path
 
 if sys.platform == "win32":
     # Use ProactorEventLoop for Windows subprocess support (required for Playwright)
@@ -397,7 +398,8 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8001"))
     reload = os.getenv("RELOAD", "true").lower() == "true"
     log_level = os.getenv("LOG_LEVEL", "info").lower()
-
+    backend_dir = Path(__file__).parent
+    sys.path.insert(0, str(backend_dir))
     print(f"🚀 Starting Contact Page Submitter API")
     print(f"📡 Server: {host}:{port}")
     print(f"🔄 Reload: {reload}")

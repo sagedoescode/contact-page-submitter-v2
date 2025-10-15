@@ -51,7 +51,7 @@ redis==5.0.1
 # Email (Optional)
 python-emails==0.6.0
 
-psutil-7.0.0
+psutil==7.0.0
 flask 
 flask-jwt-extended
 
