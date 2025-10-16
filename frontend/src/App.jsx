@@ -209,7 +209,7 @@ const App = () => {
           error: {
             iconTheme: { primary: "#ef4444", secondary: "#ffffff" },
             style: { background: "#fef2f2", color: "#991b1b", border: "1px solid #fca5a5" },
-            duration: 8001,
+            duration: 8000,
           },
           loading: {
             style: { background: "#f3f4f6", color: "#374151" },

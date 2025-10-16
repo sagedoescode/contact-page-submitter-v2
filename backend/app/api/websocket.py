@@ -1,4 +1,4 @@
-# app/api/websocket.py - Complete WebSocket implementation
+# app/api/websocket.py - Optimized WebSocket implementation
 from fastapi import (
     APIRouter,
     WebSocket,
@@ -19,9 +19,10 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.models.user import User
+from app.logging import get_logger
 
 router = APIRouter(prefix="/api/ws", tags=["websocket"], redirect_slashes=False)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ConnectionManager:
@@ -47,7 +48,17 @@ class ConnectionManager:
             "user_id": user_id,
             "connected_at": datetime.utcnow(),
         }
-        logger.info(f"WebSocket connected: user={user_id}, campaign={campaign_id}")
+
+        # Log only the connection event with essential context
+        logger.info(
+            "WebSocket connected",
+            extra={
+                "event": "ws_connect",
+                "user_id": user_id,
+                "campaign_id": campaign_id,
+                "total_connections": len(self.connection_meta),
+            },
+        )
 
     def disconnect(self, websocket: WebSocket):
         """Remove a WebSocket connection"""
@@ -55,6 +66,9 @@ class ConnectionManager:
             meta = self.connection_meta[websocket]
             campaign_id = meta.get("campaign_id")
             user_id = meta.get("user_id")
+            duration_seconds = (
+                datetime.utcnow() - meta["connected_at"]
+            ).total_seconds()
 
             if campaign_id and campaign_id in self.campaign_connections:
                 self.campaign_connections[campaign_id].discard(websocket)
@@ -67,20 +81,45 @@ class ConnectionManager:
                     del self.user_connections[user_id]
 
             del self.connection_meta[websocket]
+
+            # Log disconnection with duration for audit
             logger.info(
-                f"WebSocket disconnected: user={user_id}, campaign={campaign_id}"
+                "WebSocket disconnected",
+                extra={
+                    "event": "ws_disconnect",
+                    "user_id": user_id,
+                    "campaign_id": campaign_id,
+                    "duration_seconds": round(duration_seconds, 2),
+                    "remaining_connections": len(self.connection_meta),
+                },
             )
 
     async def send_to_campaign(self, message: str, campaign_id: str):
         """Send a message to all connections for a specific campaign"""
         if campaign_id in self.campaign_connections:
             disconnected = set()
+            send_count = 0
+            fail_count = 0
+
             for connection in self.campaign_connections[campaign_id].copy():
                 try:
                     await connection.send_text(message)
+                    send_count += 1
                 except Exception as e:
-                    logger.warning(f"Failed to send message: {e}")
+                    fail_count += 1
                     disconnected.add(connection)
+
+            # Only log if there were failures
+            if fail_count > 0:
+                logger.warning(
+                    "WebSocket broadcast had failures",
+                    extra={
+                        "event": "ws_broadcast_failure",
+                        "campaign_id": campaign_id,
+                        "successful": send_count,
+                        "failed": fail_count,
+                    },
+                )
 
             for connection in disconnected:
                 self.disconnect(connection)
@@ -107,6 +146,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
     try:
         # Verify token
         if not token:
+            logger.security_event(
+                event="ws_no_token",
+                severity="warning",
+                properties={"reason": "Missing authentication token"},
+            )
             await websocket.close(code=1008, reason="Missing token")
             return
 
@@ -114,14 +158,26 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
             payload = verify_token(token)
             user_id = payload.get("user_id")
             if not user_id:
+                logger.security_event(
+                    event="ws_invalid_token",
+                    severity="warning",
+                    properties={"reason": "Token missing user_id"},
+                )
                 await websocket.close(code=1008, reason="Invalid token payload")
                 return
         except Exception as e:
-            logger.error(f"Token verification failed: {e}")
+            logger.security_event(
+                event="ws_auth_failed",
+                severity="error",
+                properties={
+                    "reason": "Token verification failed",
+                    "error_type": type(e).__name__,
+                },
+            )
             await websocket.close(code=1008, reason="Invalid token")
             return
 
-        # Accept connection
+        # Accept connection (this will log via manager.connect)
         await manager.connect(websocket, campaign_id, user_id)
 
         # Send initial connection message
@@ -145,7 +201,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
                     message = json.loads(data)
                     message_type = message.get("type")
 
-                    # Handle different message types
+                    # Handle different message types (no logging for ping/pong - too noisy)
                     if message_type == "ping":
                         await websocket.send_json(
                             {"type": "pong", "timestamp": datetime.utcnow().isoformat()}
@@ -153,6 +209,16 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
                     elif message_type == "subscribe_campaign":
                         new_campaign_id = message.get("campaign_id")
                         if new_campaign_id:
+                            # Log campaign subscription changes
+                            logger.info(
+                                "Campaign subscription changed",
+                                extra={
+                                    "event": "ws_subscribe",
+                                    "user_id": user_id,
+                                    "old_campaign": campaign_id,
+                                    "new_campaign": new_campaign_id,
+                                },
+                            )
                             # Update the campaign subscription
                             manager.disconnect(websocket)
                             campaign_id = new_campaign_id
@@ -165,7 +231,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
                                 }
                             )
                     else:
-                        # Echo unknown messages for debugging
+                        # Echo unknown messages (no logging - handled by client)
                         await websocket.send_json(
                             {
                                 "type": "echo",
@@ -180,15 +246,27 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None)):
                     )
 
             except asyncio.TimeoutError:
-                # Send keepalive
+                # Send keepalive (no logging - this is expected every 60s)
                 await websocket.send_json(
                     {"type": "keepalive", "timestamp": datetime.utcnow().isoformat()}
                 )
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for user {user_id}")
+        # Normal disconnection - no logging needed (handled by manager.disconnect)
+        pass
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        # Unexpected errors should be logged
+        logger.error(
+            "WebSocket unexpected error",
+            extra={
+                "event": "ws_error",
+                "user_id": user_id,
+                "campaign_id": campaign_id,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+            },
+            exc_info=True,
+        )
     finally:
         manager.disconnect(websocket)
 
@@ -205,6 +283,11 @@ async def websocket_campaign_endpoint(
     try:
         # Verify token
         if not token:
+            logger.security_event(
+                event="ws_campaign_no_token",
+                severity="warning",
+                properties={"campaign_id": campaign_id},
+            )
             await websocket.close(code=1008, reason="Missing token")
             return
 
@@ -212,11 +295,18 @@ async def websocket_campaign_endpoint(
             payload = verify_token(token)
             user_id = payload.get("user_id")
         except Exception as e:
-            logger.error(f"Token verification failed: {e}")
+            logger.security_event(
+                event="ws_campaign_auth_failed",
+                severity="error",
+                properties={
+                    "campaign_id": campaign_id,
+                    "error_type": type(e).__name__,
+                },
+            )
             await websocket.close(code=1008, reason="Invalid token")
             return
 
-        # Connect to specific campaign
+        # Connect to specific campaign (logs via manager.connect)
         await manager.connect(websocket, campaign_id, user_id)
 
         # Send welcome message
@@ -238,7 +328,7 @@ async def websocket_campaign_endpoint(
 
                 try:
                     message = json.loads(data)
-                    # Handle ping/pong
+                    # Handle ping/pong (no logging)
                     if message.get("type") == "ping":
                         await websocket.send_json(
                             {"type": "pong", "timestamp": datetime.utcnow().isoformat()}
@@ -247,15 +337,27 @@ async def websocket_campaign_endpoint(
                     pass
 
             except asyncio.TimeoutError:
-                # Send keepalive
+                # Send keepalive (no logging)
                 await websocket.send_json(
                     {"type": "keepalive", "timestamp": datetime.utcnow().isoformat()}
                 )
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for campaign {campaign_id}")
+        # Normal disconnection (handled by manager.disconnect)
+        pass
     except Exception as e:
-        logger.error(f"WebSocket error for campaign {campaign_id}: {e}")
+        # Unexpected errors
+        logger.error(
+            "WebSocket campaign error",
+            extra={
+                "event": "ws_campaign_error",
+                "user_id": user_id,
+                "campaign_id": campaign_id,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+            },
+            exc_info=True,
+        )
     finally:
         manager.disconnect(websocket)
 

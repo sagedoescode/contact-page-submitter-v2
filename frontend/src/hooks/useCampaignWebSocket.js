@@ -9,7 +9,7 @@ export const useCampaignWebSocket = (campaignId) => {
     if (!campaignId) return;
 
     const ws = new WebSocket(
-      `ws://localhost:8001/api/ws/campaign/${campaignId}`
+      `ws://localhost:8000/api/ws/campaign/${campaignId}`
     );
 
     ws.onopen = () => {

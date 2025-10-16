@@ -333,78 +333,41 @@ class PageNavigator:
         except:
             pass  # Framework detection is optional
 
+    # Add to page_navigator.py
     async def find_contact_page(self, page: Page) -> Optional[str]:
-        """
-        Find contact page URL using multiple strategies.
+        """Enhanced contact page detection."""
 
-        Returns the most likely contact page URL.
-        """
-        self.logger.info("Searching for contact page links")
+        # Priority 1: Check navigation menu
+        nav_contact = await self._find_contact_in_navigation(page)
+        if nav_contact:
+            return nav_contact
 
-        contact_urls = []
-        current_url = page.url
+        # Priority 2: Check footer (often has contact link)
+        footer_contact = await self._find_contact_in_footer(page)
+        if footer_contact:
+            return footer_contact
 
-        # Strategy 1: Look for links with contact-related href
-        href_selectors = [
-            f'a[href*="{pattern}" i]' for pattern in self.contact_patterns
+        # Priority 3: Check all visible links
+        contact_patterns = [
+            "contact",
+            "contact-us",
+            "get-in-touch",
+            "reach-out",
+            "connect",
+            "talk-to-us",
         ]
 
-        for selector in href_selectors:
-            try:
-                links = await page.query_selector_all(selector)
-                for link in links:
+        for pattern in contact_patterns:
+            selector = f'a[href*="{pattern}" i]'
+            links = await page.query_selector_all(selector)
+
+            for link in links:
+                if await link.is_visible():
                     href = await link.get_attribute("href")
-                    if href and await link.is_visible():
+                    if href:
                         full_url = urljoin(page.url, href)
-                        # Don't return current page
-                        if full_url != current_url:
-                            contact_urls.append((full_url, 10))  # High priority
+                        return full_url
 
-            except Exception as e:
-                self.logger.warning(f"Error with selector {selector}: {e}")
-
-        # Strategy 2: Look for links with contact-related text
-        for text_pattern in self.contact_link_texts:
-            try:
-                # Use different selector syntax for better compatibility
-                links = await page.query_selector_all(f"a")
-                for link in links:
-                    link_text = await link.inner_text()
-                    if link_text and text_pattern.lower() in link_text.lower():
-                        href = await link.get_attribute("href")
-                        if href and await link.is_visible():
-                            full_url = urljoin(page.url, href)
-                            if full_url != current_url:
-                                contact_urls.append(
-                                    (full_url, 8)
-                                )  # Medium-high priority
-
-            except Exception as e:
-                self.logger.warning(f"Error with text pattern {text_pattern}: {e}")
-
-        # Strategy 3: Check navigation menus
-        nav_contact_url = await self._find_contact_in_navigation(page)
-        if nav_contact_url and nav_contact_url != current_url:
-            contact_urls.append((nav_contact_url, 9))  # High priority
-
-        # Strategy 4: Check footer
-        footer_contact_url = await self._find_contact_in_footer(page)
-        if footer_contact_url and footer_contact_url != current_url:
-            contact_urls.append((footer_contact_url, 7))  # Medium priority
-
-        # Deduplicate and sort by priority
-        unique_urls = {}
-        for url, priority in contact_urls:
-            if url not in unique_urls or unique_urls[url] < priority:
-                unique_urls[url] = priority
-
-        if unique_urls:
-            # Return highest priority URL
-            best_url = max(unique_urls.items(), key=lambda x: x[1])[0]
-            self.logger.info(f"Found contact page: {best_url}")
-            return best_url
-
-        self.logger.info("No contact page found")
         return None
 
     async def _find_contact_in_navigation(self, page: Page) -> Optional[str]:

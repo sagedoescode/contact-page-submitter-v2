@@ -1,4 +1,4 @@
-"""Enhanced Submissions API endpoints with comprehensive logging."""
+"""Enhanced Submissions API endpoints with optimized logging."""
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from sqlalchemy.orm import Session
@@ -6,7 +6,6 @@ from sqlalchemy.exc import SQLAlchemyError
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 import time
-from functools import wraps
 import uuid
 import json
 from pydantic import BaseModel, Field
@@ -15,19 +14,21 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.services.log_service import LogService as ApplicationInsightsLogger
-from app.logging import get_logger, log_function, log_exceptions
+from app.logging import get_logger, log_function
 from app.logging.core import request_id_var, user_id_var, campaign_id_var
 
 # Initialize structured logger
 logger = get_logger(__name__)
 
-# Create FastAPI router (converted from Flask Blueprint)
-# router = APIRouter(prefix="/api/submissions", tags=["submissions"], redirect_slashes=False)
+# Create FastAPI router
 router = APIRouter(tags=["submissions"], redirect_slashes=False)
 
-# Simulated submission storage
+# Simulated submission storage (replace with actual database)
 SUBMISSIONS_DB = {}
 SUBMISSION_STATS = {"total": 0, "pending": 0, "approved": 0, "rejected": 0, "spam": 0}
+
+# Spam detection keywords
+SPAM_KEYWORDS = ["viagra", "casino", "lottery", "prize", "winner", "bitcoin", "crypto"]
 
 
 # Pydantic models for request/response
@@ -43,86 +44,20 @@ class StatusUpdateRequest(BaseModel):
     reason: Optional[str] = ""
 
 
-def log_submission_operation(func):
-    """Decorator for logging submission operations."""
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    if not request:
+        return "unknown"
 
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        operation = func.__name__.replace("_", " ").title()
-        start_time = time.time()
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
 
-        # Extract request and user from function arguments
-        request = None
-        current_user = None
-        for arg in args:
-            if isinstance(arg, Request):
-                request = arg
-        for key, value in kwargs.items():
-            if key == "current_user" and isinstance(value, User):
-                current_user = value
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
 
-        context = {
-            "operation": operation,
-            "endpoint": request.url.path if request else "unknown",
-            "method": request.method if request else "unknown",
-            "ip": request.client.host if request and request.client else "unknown",
-            "user_agent": (
-                request.headers.get("User-Agent", "Unknown") if request else "Unknown"
-            ),
-        }
-
-        # Add user context if available
-        if current_user:
-            context["user_id"] = str(current_user.id)
-        else:
-            context["user_id"] = "anonymous"
-
-        # Extract submission ID from kwargs
-        if "submission_id" in kwargs:
-            context["submission_id"] = kwargs["submission_id"]
-
-        logger.info(f"Starting submission operation: {operation}", context=context)
-
-        try:
-            result = func(*args, **kwargs)
-            duration = time.time() - start_time
-
-            logger.info(
-                f"Submission operation completed: {operation}",
-                context={
-                    **context,
-                    "duration": duration,
-                    "status": "success",
-                },
-            )
-
-            # Log performance for slow operations (Fixed: replaced log_performance)
-            if duration > 1.0:
-                logger.warning(
-                    f"Slow operation detected: {operation}",
-                    context={
-                        **context,
-                        "duration": duration,
-                        "performance_threshold_exceeded": True,
-                    },
-                )
-
-            return result
-
-        except Exception as e:
-            duration = time.time() - start_time
-            logger.error(
-                f"Submission operation failed: {operation}",
-                context={
-                    **context,
-                    "duration": duration,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                },
-            )
-            raise
-
-    return wrapper
+    return request.client.host if request.client else "unknown"
 
 
 def validate_submission_data(data: Dict[str, Any]) -> tuple[bool, Optional[str]]:
@@ -153,62 +88,49 @@ def validate_submission_data(data: Dict[str, Any]) -> tuple[bool, Optional[str]]
 
 def check_spam(submission_data: Dict[str, Any]) -> bool:
     """Check if submission is spam."""
-    # Simple spam detection (implement more sophisticated logic)
-    spam_keywords = ["viagra", "casino", "lottery", "prize", "winner"]
     content = submission_data.get("content", "").lower()
     title = submission_data.get("title", "").lower()
 
-    for keyword in spam_keywords:
+    for keyword in SPAM_KEYWORDS:
         if keyword in content or keyword in title:
-            logger.warning(
-                "Potential spam detected",
-                context={
-                    "keyword": keyword,
-                    "submission_type": submission_data.get("type"),
-                },
-            )
             return True
+
+    # Check for excessive links
+    link_count = content.count("http://") + content.count("https://")
+    if link_count > 5:
+        return True
 
     return False
 
 
 def is_admin(user: User) -> bool:
-    """Check if user is an admin (implement your logic)."""
-    # Placeholder - implement actual admin check
-    # You might check user.role or similar
+    """Check if user is an admin."""
+    # Implement your actual admin check logic
+    # return user.role == "admin"
     return False
 
 
 @router.post("/submit")
-@log_submission_operation
-def create_submission(
+@log_function("create_submission")
+async def create_submission(
     request: Request,
     submission_data: SubmissionCreateRequest,
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(lambda: None),  # Allow anonymous submissions
+    current_user: Optional[User] = Depends(lambda: None),  # Allow anonymous
 ):
     """Create a new submission."""
     try:
         data = submission_data.model_dump()
-        app_logger = ApplicationInsightsLogger(db)
+        client_ip = get_client_ip(request)
 
         # Get user context
         user_id = str(current_user.id) if current_user else "anonymous"
-
         if current_user:
-            app_logger.set_context(user_id=str(current_user.id))
+            user_id_var.set(user_id)
 
         # Validate submission data
         is_valid, error_message = validate_submission_data(data)
         if not is_valid:
-            logger.warning(
-                "Invalid submission data",
-                context={
-                    "error": error_message,
-                    "user_id": user_id,
-                    "ip": request.client.host if request.client else "unknown",
-                },
-            )
             raise HTTPException(status_code=400, detail=error_message)
 
         # Check for spam
@@ -226,7 +148,7 @@ def create_submission(
             "status": "spam" if is_spam else "pending",
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
-            "ip_address": request.client.host if request.client else "unknown",
+            "ip_address": client_ip,
             "user_agent": request.headers.get("User-Agent", "Unknown"),
         }
 
@@ -235,14 +157,28 @@ def create_submission(
 
         # Update stats
         SUBMISSION_STATS["total"] += 1
+
         if is_spam:
             SUBMISSION_STATS["spam"] += 1
 
-            # Fixed: replaced log_security_event with proper logging
+            # Log spam detection
+            logger.security_event(
+                event="spam_submission_detected",
+                severity="warning",
+                properties={
+                    "submission_id": submission_id,
+                    "submission_type": data["type"],
+                    "user_id": user_id,
+                    "ip": client_ip,
+                },
+            )
+
+            # Track in ApplicationInsights
+            app_logger = ApplicationInsightsLogger(db)
             app_logger.track_security_event(
                 event_name="spam_submission",
                 user_id=user_id,
-                ip_address=request.client.host if request.client else "unknown",
+                ip_address=client_ip,
                 success=False,
                 details={
                     "submission_id": submission_id,
@@ -252,15 +188,16 @@ def create_submission(
         else:
             SUBMISSION_STATS["pending"] += 1
 
-        logger.info(
-            "Submission created successfully",
-            context={
-                "submission_id": submission_id,
-                "user_id": user_id,
-                "type": data["type"],
-                "status": submission["status"],
-            },
-        )
+            # Only log non-spam submissions of important types
+            if data["type"] in ["report", "application"]:
+                logger.info(
+                    "Important submission created",
+                    extra={
+                        "submission_id": submission_id,
+                        "type": data["type"],
+                        "user_id": user_id,
+                    },
+                )
 
         return {
             "success": True,
@@ -274,69 +211,52 @@ def create_submission(
     except Exception as e:
         logger.error(
             "Failed to create submission",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "ip": request.client.host if request.client else "unknown",
+                "ip": get_client_ip(request),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to create submission")
 
 
 @router.get("/{submission_id}")
-@log_submission_operation
-def get_submission(
+@log_function("get_submission")
+async def get_submission(
     submission_id: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get a specific submission."""
-    try:
-        user_id = str(current_user.id)
-        app_logger = ApplicationInsightsLogger(db)
-        app_logger.set_context(user_id=user_id)
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
+    try:
         # Check if submission exists
         if submission_id not in SUBMISSIONS_DB:
-            logger.warning(
-                "Submission not found",
-                context={"submission_id": submission_id, "user_id": user_id},
-            )
             raise HTTPException(status_code=404, detail="Submission not found")
 
         submission = SUBMISSIONS_DB[submission_id]
 
         # Check access permissions
         if submission["user_id"] != user_id and not is_admin(current_user):
-            logger.warning(
-                "Unauthorized submission access attempt",
-                context={
+            # Log unauthorized access attempt
+            logger.security_event(
+                event="unauthorized_submission_access",
+                severity="warning",
+                properties={
                     "submission_id": submission_id,
                     "user_id": user_id,
                     "owner_id": submission["user_id"],
-                },
-            )
-
-            # Fixed: replaced log_security_event with proper logging
-            app_logger.track_security_event(
-                event_name="unauthorized_submission_access",
-                user_id=user_id,
-                ip_address=request.client.host if request.client else "unknown",
-                success=False,
-                details={
-                    "submission_id": submission_id,
-                    "owner_id": submission["user_id"],
+                    "ip": get_client_ip(request),
                 },
             )
 
             raise HTTPException(status_code=403, detail="Unauthorized access")
 
-        logger.info(
-            "Submission retrieved",
-            context={"submission_id": submission_id, "user_id": user_id},
-        )
-
+        # No logging for successful retrieval
         return {"success": True, "submission": submission}
 
     except HTTPException:
@@ -344,19 +264,18 @@ def get_submission(
     except Exception as e:
         logger.error(
             "Failed to retrieve submission",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "submission_id": submission_id,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to retrieve submission")
 
 
 @router.get("/list")
-@log_submission_operation
-def list_submissions(
+async def list_submissions(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -368,21 +287,10 @@ def list_submissions(
     sort_order: str = Query("desc"),
 ):
     """List submissions with filtering and pagination."""
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
+
     try:
-        user_id = str(current_user.id)
-        app_logger = ApplicationInsightsLogger(db)
-        app_logger.set_context(user_id=user_id)
-
-        logger.info(
-            "Listing submissions",
-            context={
-                "user_id": user_id,
-                "page": page,
-                "per_page": per_page,
-                "filters": {"status": status, "type": type},
-            },
-        )
-
         # Filter submissions
         filtered_submissions = []
         for submission_id, submission in SUBMISSIONS_DB.items():
@@ -413,14 +321,7 @@ def list_submissions(
         end = start + per_page
         paginated = filtered_submissions[start:end]
 
-        logger.info(
-            "Submissions listed successfully",
-            context={
-                "user_id": user_id,
-                "total_results": total,
-                "returned_results": len(paginated),
-            },
-        )
+        # No logging for routine list operations
 
         return {
             "success": True,
@@ -436,18 +337,18 @@ def list_submissions(
     except Exception as e:
         logger.error(
             "Failed to list submissions",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to list submissions")
 
 
 @router.put("/{submission_id}/status")
-@log_submission_operation
-def update_submission_status(
+@log_function("update_submission_status")
+async def update_submission_status(
     submission_id: str,
     status_data: StatusUpdateRequest,
     request: Request,
@@ -455,25 +356,16 @@ def update_submission_status(
     current_user: User = Depends(get_current_user),
 ):
     """Update submission status (admin only)."""
-    try:
-        user_id = str(current_user.id)
-        app_logger = ApplicationInsightsLogger(db)
-        app_logger.set_context(user_id=user_id)
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
+    try:
         new_status = status_data.status
         reason = status_data.reason
 
         # Validate status
         valid_statuses = ["pending", "reviewing", "approved", "rejected", "spam"]
         if new_status not in valid_statuses:
-            logger.warning(
-                "Invalid status update attempt",
-                context={
-                    "submission_id": submission_id,
-                    "user_id": user_id,
-                    "invalid_status": new_status,
-                },
-            )
             raise HTTPException(
                 status_code=400,
                 detail=f'Invalid status. Must be one of: {", ".join(valid_statuses)}',
@@ -481,14 +373,16 @@ def update_submission_status(
 
         # Check if submission exists
         if submission_id not in SUBMISSIONS_DB:
-            logger.warning(
-                "Status update for non-existent submission",
-                context={"submission_id": submission_id, "user_id": user_id},
-            )
             raise HTTPException(status_code=404, detail="Submission not found")
 
         submission = SUBMISSIONS_DB[submission_id]
         old_status = submission["status"]
+
+        # Check admin permission
+        if not is_admin(current_user):
+            # Check if user owns submission and can only cancel
+            if submission["user_id"] != user_id or new_status != "cancelled":
+                raise HTTPException(status_code=403, detail="Admin access required")
 
         # Update status
         submission["status"] = new_status
@@ -503,23 +397,26 @@ def update_submission_status(
         if new_status in SUBMISSION_STATS:
             SUBMISSION_STATS[new_status] += 1
 
-        logger.info(
-            "Submission status updated",
-            context={
-                "submission_id": submission_id,
-                "user_id": user_id,
-                "old_status": old_status,
-                "new_status": new_status,
-                "reason": reason,
-            },
-        )
-
-        # Log security event for important status changes (Fixed: replaced log_security_event)
+        # Log important status changes only
         if new_status in ["approved", "rejected"]:
+            logger.info(
+                f"Submission {new_status}",
+                extra={
+                    "submission_id": submission_id,
+                    "user_id": user_id,
+                    "old_status": old_status,
+                    "new_status": new_status,
+                    "reason": reason,
+                    "ip": get_client_ip(request),
+                },
+            )
+
+            # Track in ApplicationInsights
+            app_logger = ApplicationInsightsLogger(db)
             app_logger.track_security_event(
                 event_name=f"submission_{new_status}",
                 user_id=user_id,
-                ip_address=request.client.host if request.client else "unknown",
+                ip_address=get_client_ip(request),
                 success=True,
                 details={
                     "submission_id": submission_id,
@@ -540,60 +437,45 @@ def update_submission_status(
     except Exception as e:
         logger.error(
             "Failed to update submission status",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "submission_id": submission_id,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to update status")
 
 
 @router.delete("/{submission_id}")
-@log_submission_operation
-def delete_submission(
+async def delete_submission(
     submission_id: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Delete a submission."""
-    try:
-        user_id = str(current_user.id)
-        app_logger = ApplicationInsightsLogger(db)
-        app_logger.set_context(user_id=user_id)
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
+    try:
         # Check if submission exists
         if submission_id not in SUBMISSIONS_DB:
-            logger.warning(
-                "Delete attempt for non-existent submission",
-                context={"submission_id": submission_id, "user_id": user_id},
-            )
             raise HTTPException(status_code=404, detail="Submission not found")
 
         submission = SUBMISSIONS_DB[submission_id]
 
         # Check permissions
         if submission["user_id"] != user_id and not is_admin(current_user):
-            logger.warning(
-                "Unauthorized submission delete attempt",
-                context={
+            # Log unauthorized delete attempt
+            logger.security_event(
+                event="unauthorized_submission_delete",
+                severity="warning",
+                properties={
                     "submission_id": submission_id,
                     "user_id": user_id,
                     "owner_id": submission["user_id"],
-                },
-            )
-
-            # Fixed: replaced log_security_event with proper logging
-            app_logger.track_security_event(
-                event_name="unauthorized_submission_delete",
-                user_id=user_id,
-                ip_address=request.client.host if request.client else "unknown",
-                success=False,
-                details={
-                    "submission_id": submission_id,
-                    "owner_id": submission["user_id"],
+                    "ip": get_client_ip(request),
                 },
             )
 
@@ -601,6 +483,7 @@ def delete_submission(
 
         # Delete submission
         status_val = submission["status"]
+        submission_type = submission["type"]
         del SUBMISSIONS_DB[submission_id]
 
         # Update stats
@@ -608,14 +491,17 @@ def delete_submission(
             SUBMISSION_STATS[status_val] = max(0, SUBMISSION_STATS[status_val] - 1)
         SUBMISSION_STATS["total"] = max(0, SUBMISSION_STATS["total"] - 1)
 
-        logger.info(
-            "Submission deleted",
-            context={
-                "submission_id": submission_id,
-                "user_id": user_id,
-                "submission_type": submission["type"],
-            },
-        )
+        # Only log deletion of important submissions
+        if submission_type in ["report", "application"]:
+            logger.info(
+                "Important submission deleted",
+                extra={
+                    "submission_id": submission_id,
+                    "submission_type": submission_type,
+                    "user_id": user_id,
+                    "ip": get_client_ip(request),
+                },
+            )
 
         return {"success": True, "message": "Submission deleted successfully"}
 
@@ -624,29 +510,26 @@ def delete_submission(
     except Exception as e:
         logger.error(
             "Failed to delete submission",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "submission_id": submission_id,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to delete submission")
 
 
 @router.get("/stats")
-@log_submission_operation
-def get_submission_stats(
+async def get_submission_stats(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get submission statistics."""
-    try:
-        user_id = str(current_user.id)
-        app_logger = ApplicationInsightsLogger(db)
-        app_logger.set_context(user_id=user_id)
+    user_id_var.set(str(current_user.id))
 
+    try:
         # Calculate additional stats
         stats = SUBMISSION_STATS.copy()
 
@@ -669,10 +552,26 @@ def get_submission_stats(
             if created_at >= this_month:
                 stats["this_month"] += 1
 
-        logger.info(
-            "Submission statistics retrieved",
-            context={"user_id": user_id, "total_submissions": stats["total"]},
-        )
+        # Calculate rates
+        if stats["total"] > 0:
+            stats["approval_rate"] = round(
+                (stats.get("approved", 0) / stats["total"]) * 100, 2
+            )
+            stats["spam_rate"] = round((stats.get("spam", 0) / stats["total"]) * 100, 2)
+        else:
+            stats["approval_rate"] = 0
+            stats["spam_rate"] = 0
+
+        # Only log if high spam rate detected
+        if stats["spam_rate"] > 30:
+            logger.warning(
+                "High spam rate detected",
+                extra={
+                    "spam_rate": stats["spam_rate"],
+                    "total_spam": stats.get("spam", 0),
+                    "total_submissions": stats["total"],
+                },
+            )
 
         return {
             "success": True,
@@ -683,10 +582,10 @@ def get_submission_stats(
     except Exception as e:
         logger.error(
             "Failed to get submission statistics",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to retrieve statistics")

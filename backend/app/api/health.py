@@ -1,4 +1,4 @@
-"""Enhanced Health Check API endpoints for FastAPI with comprehensive logging."""
+"""Enhanced Health Check API endpoints for FastAPI with optimized logging."""
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
@@ -7,27 +7,28 @@ import time
 import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
-from functools import wraps
-import logging
 import asyncio
-
 
 # Import dependencies - adjust based on your actual project structure
 try:
     from app.core.dependencies import get_current_user
-    from app.logging import get_logger
-
+    from app.logging import get_logger, log_function
+    from app.logging.core import request_id_var, user_id_var
     HAS_AUTH = True
 except ImportError:
+    import logging
     HAS_AUTH = False
-
-    # Fallback if dependencies not available
+    
     def get_current_user():
         return {"id": "anonymous"}
-
+    
     def get_logger(name):
         return logging.getLogger(name)
-
+    
+    def log_function(name):
+        def decorator(func):
+            return func
+        return decorator
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -40,7 +41,20 @@ router = APIRouter(
 )
 
 # Health check cache
-HEALTH_CACHE = {"last_check": None, "results": {}, "cache_duration": 10}  # seconds
+HEALTH_CACHE = {
+    "last_check": None, 
+    "results": {}, 
+    "cache_duration": 10,  # seconds
+    "failure_count": 0,
+    "last_failure": None
+}
+
+# Resource thresholds
+RESOURCE_THRESHOLDS = {
+    "cpu": {"warning": 80, "critical": 95},
+    "memory": {"warning": 80, "critical": 95},
+    "disk": {"warning": 80, "critical": 95}
+}
 
 
 # Pydantic models for responses
@@ -89,59 +103,42 @@ class MetricsResponse(BaseModel):
     error: Optional[str] = None
 
 
-def log_performance(operation: str, duration: float, context: Dict[str, Any]):
-    """Log performance metrics for slow operations."""
-    logger.warning(
-        f"Slow operation detected: {operation}",
-        extra={
-            "operation": operation,
-            "duration": duration,
-            "threshold": 2.0,
-            **context,
-        },
-    )
-
-
-def log_security_event(
-    event_type: str, context: Dict[str, Any], severity: str = "warning"
-):
-    """Log security-related events."""
-    log_method = getattr(logger, severity, logger.warning)
-    log_method(
-        f"Security event: {event_type}",
-        extra={"event_type": event_type, "severity": severity, **context},
-    )
-
-
 async def check_database_health() -> Dict[str, Any]:
     """Check database connectivity and performance."""
     start_time = time.time()
-
+    
     try:
         # Replace with actual database check
         # from app.core.database import get_db
         # async with get_db() as db:
         #     await db.execute("SELECT 1")
-
+        
         # Simulated check
         await asyncio.sleep(0.01)  # Simulate DB query
-
+        
         response_time = (time.time() - start_time) * 1000  # Convert to ms
-
-        logger.debug(
-            "Database health check passed",
-            extra={"response_time_ms": response_time, "status": "healthy"},
-        )
-
+        
+        # Only log if slow response
+        if response_time > 100:
+            logger.warning(
+                "Slow database health check",
+                extra={"response_time_ms": response_time}
+            )
+        
         return {
             "status": "healthy",
             "response_time_ms": response_time,
             "timestamp": datetime.utcnow().isoformat(),
         }
     except Exception as e:
+        # Always log database failures - critical for operations
         logger.error(
             "Database health check failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            },
+            exc_info=True
         )
         return {
             "status": "unhealthy",
@@ -159,19 +156,23 @@ async def check_redis_health() -> Dict[str, Any]:
         # await redis.ping()
         # redis.close()
         # await redis.wait_closed()
-
+        
         # Simulated check
-        import asyncio
-
         await asyncio.sleep(0.01)  # Simulate Redis ping
-
-        logger.debug("Redis health check passed")
-
-        return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+        
+        # No logging for successful Redis checks
+        return {
+            "status": "healthy", 
+            "timestamp": datetime.utcnow().isoformat()
+        }
     except Exception as e:
+        # Log Redis failures
         logger.error(
             "Redis health check failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
         )
         return {
             "status": "unhealthy",
@@ -186,14 +187,16 @@ def check_system_resources() -> Dict[str, Any]:
         cpu_percent = psutil.cpu_percent(interval=1)
         memory = psutil.virtual_memory()
         disk = psutil.disk_usage("/")
-
+        
         resources = {
             "cpu": {
                 "usage_percent": cpu_percent,
                 "status": (
                     "healthy"
-                    if cpu_percent < 80
-                    else "warning" if cpu_percent < 95 else "critical"
+                    if cpu_percent < RESOURCE_THRESHOLDS["cpu"]["warning"]
+                    else "warning" 
+                    if cpu_percent < RESOURCE_THRESHOLDS["cpu"]["critical"] 
+                    else "critical"
                 ),
             },
             "memory": {
@@ -202,8 +205,10 @@ def check_system_resources() -> Dict[str, Any]:
                 "total_gb": round(memory.total / (1024**3), 2),
                 "status": (
                     "healthy"
-                    if memory.percent < 80
-                    else "warning" if memory.percent < 95 else "critical"
+                    if memory.percent < RESOURCE_THRESHOLDS["memory"]["warning"]
+                    else "warning" 
+                    if memory.percent < RESOURCE_THRESHOLDS["memory"]["critical"] 
+                    else "critical"
                 ),
             },
             "disk": {
@@ -212,66 +217,66 @@ def check_system_resources() -> Dict[str, Any]:
                 "total_gb": round(disk.total / (1024**3), 2),
                 "status": (
                     "healthy"
-                    if disk.percent < 80
-                    else "warning" if disk.percent < 95 else "critical"
+                    if disk.percent < RESOURCE_THRESHOLDS["disk"]["warning"]
+                    else "warning" 
+                    if disk.percent < RESOURCE_THRESHOLDS["disk"]["critical"] 
+                    else "critical"
                 ),
             },
         }
-
-        # Log warnings for high resource usage
-        if cpu_percent > 80:
-            logger.warning(
-                "High CPU usage detected", extra={"cpu_percent": cpu_percent}
+        
+        # Only log critical resource issues
+        if cpu_percent >= RESOURCE_THRESHOLDS["cpu"]["critical"]:
+            logger.critical(
+                "Critical CPU usage",
+                extra={"cpu_percent": cpu_percent}
             )
-
-        if memory.percent > 80:
-            logger.warning(
-                "High memory usage detected", extra={"memory_percent": memory.percent}
+        elif memory.percent >= RESOURCE_THRESHOLDS["memory"]["critical"]:
+            logger.critical(
+                "Critical memory usage",
+                extra={"memory_percent": memory.percent}
             )
-
-        if disk.percent > 80:
-            logger.warning(
-                "High disk usage detected", extra={"disk_percent": disk.percent}
+        elif disk.percent >= RESOURCE_THRESHOLDS["disk"]["critical"]:
+            logger.critical(
+                "Critical disk usage",
+                extra={"disk_percent": disk.percent}
             )
-
+        
         return resources
-
+        
     except Exception as e:
         logger.error(
             "System resource check failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            }
         )
         return {"status": "error", "error": str(e)}
 
 
 @router.get("/check", response_model=HealthStatus)
 async def basic_health_check(request: Request):
-    """Basic health check endpoint."""
-    start_time = time.time()
-
+    """Basic health check endpoint - minimal logging."""
     try:
-        client_ip = request.client.host if request.client else "unknown"
-        logger.info("Basic health check requested", extra={"ip": client_ip})
-
-        result = HealthStatus(
+        # No logging for basic health checks unless they fail
+        # These are called frequently by load balancers
+        
+        return HealthStatus(
             status="healthy",
             service="api",
             timestamp=datetime.utcnow().isoformat(),
             uptime_seconds=time.time() - psutil.boot_time(),
         )
-
-        duration = time.time() - start_time
-        logger.info(
-            "Basic health check completed",
-            extra={"duration": duration, "status": "healthy", "ip": client_ip},
-        )
-
-        return result
-
+    
     except Exception as e:
         logger.error(
             "Basic health check failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            },
+            exc_info=True
         )
         raise HTTPException(
             status_code=503,
@@ -284,89 +289,96 @@ async def basic_health_check(request: Request):
 
 
 @router.get("/detailed", response_model=DetailedHealth)
+@log_function("detailed_health_check")
 async def detailed_health_check(request: Request):
     """Detailed health check with all service dependencies."""
-    start_time = time.time()
-
     try:
-        client_ip = request.client.host if request.client else "unknown"
-
-        # Check cache
+        # Check cache first
         if HEALTH_CACHE["last_check"]:
             cache_age = time.time() - HEALTH_CACHE["last_check"]
             if cache_age < HEALTH_CACHE["cache_duration"]:
-                logger.info(
-                    "Returning cached health check results",
-                    extra={"cache_age": cache_age, "ip": client_ip},
-                )
+                # Return cached results without logging
                 return HEALTH_CACHE["results"]
-
-        logger.info("Performing detailed health check", extra={"ip": client_ip})
-
+        
         # Perform all health checks
-        import asyncio
-
         database_health, redis_health = await asyncio.gather(
-            check_database_health(), check_redis_health()
+            check_database_health(), 
+            check_redis_health()
         )
-
+        
         checks = {
             "database": database_health,
             "redis": redis_health,
             "system": check_system_resources(),
         }
-
+        
         # Determine overall health
         overall_status = "healthy"
+        unhealthy_services = []
+        
         for service, status in checks.items():
-            if isinstance(status, dict) and status.get("status") == "unhealthy":
-                overall_status = "degraded"
-                break
-            elif isinstance(status, dict) and status.get("status") == "critical":
-                overall_status = "critical"
-                break
-
+            if isinstance(status, dict):
+                if status.get("status") == "critical":
+                    overall_status = "critical"
+                    unhealthy_services.append(service)
+                elif status.get("status") == "unhealthy" and overall_status != "critical":
+                    overall_status = "degraded"
+                    unhealthy_services.append(service)
+        
         response = DetailedHealth(
             status=overall_status,
             timestamp=datetime.utcnow().isoformat(),
             services=checks,
             uptime_seconds=time.time() - psutil.boot_time(),
         )
-
+        
         # Update cache
         HEALTH_CACHE["last_check"] = time.time()
         HEALTH_CACHE["results"] = response
-
-        # Log overall health status
-        duration = time.time() - start_time
-        logger.info(
-            "Detailed health check completed",
-            extra={
-                "overall_status": overall_status,
-                "services_checked": list(checks.keys()),
-                "ip": client_ip,
-                "duration": duration,
-            },
-        )
-
-        if duration > 2.0:
-            log_performance(
-                operation="detailed_health_check",
-                duration=duration,
-                context={"status": overall_status},
-            )
-
+        
+        # Only log if status changed or unhealthy
         if overall_status != "healthy":
+            if overall_status != HEALTH_CACHE.get("last_status"):
+                logger.warning(
+                    "Health status changed",
+                    extra={
+                        "new_status": overall_status,
+                        "previous_status": HEALTH_CACHE.get("last_status", "unknown"),
+                        "unhealthy_services": unhealthy_services
+                    }
+                )
+            HEALTH_CACHE["last_status"] = overall_status
+            HEALTH_CACHE["failure_count"] += 1
+            HEALTH_CACHE["last_failure"] = time.time()
+            
             raise HTTPException(status_code=503, detail=response.dict())
-
+        else:
+            # Reset failure tracking on recovery
+            if HEALTH_CACHE.get("last_status") != "healthy" and HEALTH_CACHE["failure_count"] > 0:
+                logger.info(
+                    "Health recovered",
+                    extra={
+                        "failure_count": HEALTH_CACHE["failure_count"],
+                        "downtime_seconds": time.time() - HEALTH_CACHE.get("last_failure", time.time())
+                    }
+                )
+                HEALTH_CACHE["failure_count"] = 0
+                HEALTH_CACHE["last_failure"] = None
+            
+            HEALTH_CACHE["last_status"] = overall_status
+        
         return response
-
+    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(
             "Detailed health check error",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            },
+            exc_info=True
         )
         raise HTTPException(
             status_code=503,
@@ -380,22 +392,22 @@ async def detailed_health_check(request: Request):
 
 @router.get("/readiness", response_model=ReadinessResponse)
 async def readiness_check(request: Request):
-    """Kubernetes readiness probe endpoint."""
+    """Kubernetes readiness probe endpoint - minimal logging."""
     try:
-        client_ip = request.client.host if request.client else "unknown"
-
         # Check if service is ready to accept traffic
         db_health = await check_database_health()
-
+        
         if db_health["status"] == "healthy":
-            logger.info("Readiness check passed", extra={"ip": client_ip})
+            # No logging for successful readiness checks
             return ReadinessResponse(
-                ready=True, timestamp=datetime.utcnow().isoformat()
+                ready=True, 
+                timestamp=datetime.utcnow().isoformat()
             )
         else:
+            # Log readiness failures
             logger.warning(
                 "Readiness check failed",
-                extra={"reason": "database_unhealthy", "ip": client_ip},
+                extra={"reason": "database_unhealthy"}
             )
             raise HTTPException(
                 status_code=503,
@@ -405,13 +417,17 @@ async def readiness_check(request: Request):
                     "timestamp": datetime.utcnow().isoformat(),
                 },
             )
-
+    
     except HTTPException:
         raise
     except Exception as e:
         logger.error(
             "Readiness check error",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            },
+            exc_info=True
         )
         raise HTTPException(
             status_code=503,
@@ -425,17 +441,23 @@ async def readiness_check(request: Request):
 
 @router.get("/liveness", response_model=LivenessResponse)
 async def liveness_check(request: Request):
-    """Kubernetes liveness probe endpoint."""
+    """Kubernetes liveness probe endpoint - no logging."""
     try:
-        client_ip = request.client.host if request.client else "unknown"
-        logger.debug("Liveness check requested", extra={"ip": client_ip})
-
-        return LivenessResponse(alive=True, timestamp=datetime.utcnow().isoformat())
-
+        # Never log successful liveness checks - too frequent
+        return LivenessResponse(
+            alive=True, 
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
     except Exception as e:
-        logger.error(
+        # Only log if liveness fails (critical issue)
+        logger.critical(
             "Liveness check failed",
-            extra={"error": str(e), "error_type": type(e).__name__},
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__
+            },
+            exc_info=True
         )
         raise HTTPException(
             status_code=503,
@@ -448,6 +470,7 @@ async def liveness_check(request: Request):
 
 
 @router.get("/metrics", response_model=MetricsResponse)
+@log_function("get_health_metrics")
 async def get_health_metrics(
     request: Request,
     current_user: Optional[Dict] = Depends(get_current_user) if HAS_AUTH else None,
@@ -455,38 +478,56 @@ async def get_health_metrics(
     """Get detailed health metrics (admin only)."""
     try:
         user_id = current_user.get("id") if current_user else "anonymous"
-
+        
+        if HAS_AUTH and user_id:
+            user_id_var.set(user_id)
+        
         # TODO: Add admin check
         # if not is_admin(user_id):
         #     raise HTTPException(status_code=403, detail="Unauthorized")
-
+        
         # Collect detailed metrics
-        import asyncio
-
         database_health, redis_health = await asyncio.gather(
-            check_database_health(), check_redis_health()
+            check_database_health(), 
+            check_redis_health()
         )
-
+        
+        process = psutil.Process()
+        
         metrics = {
             "system": check_system_resources(),
-            "services": {"database": database_health, "redis": redis_health},
+            "services": {
+                "database": database_health, 
+                "redis": redis_health
+            },
             "process": {
                 "pid": os.getpid(),
-                "cpu_percent": psutil.Process().cpu_percent(),
-                "memory_mb": round(psutil.Process().memory_info().rss / (1024**2), 2),
-                "num_threads": psutil.Process().num_threads(),
-                "open_files": len(psutil.Process().open_files()),
+                "cpu_percent": process.cpu_percent(),
+                "memory_mb": round(process.memory_info().rss / (1024**2), 2),
+                "num_threads": process.num_threads(),
+                "open_files": len(process.open_files()) if hasattr(process, 'open_files') else 0,
+            },
+            "cache": {
+                "last_check": HEALTH_CACHE.get("last_check"),
+                "failure_count": HEALTH_CACHE.get("failure_count", 0),
+                "last_failure": HEALTH_CACHE.get("last_failure"),
+                "last_status": HEALTH_CACHE.get("last_status", "unknown")
             },
             "timestamp": datetime.utcnow().isoformat(),
         }
-
-        logger.info(
-            "Health metrics retrieved",
-            extra={"user_id": user_id, "metrics_collected": list(metrics.keys())},
-        )
-
+        
+        # Log metrics access for audit
+        if user_id != "anonymous":
+            logger.info(
+                "Health metrics accessed",
+                extra={
+                    "user_id": user_id,
+                    "failure_count": HEALTH_CACHE.get("failure_count", 0)
+                }
+            )
+        
         return MetricsResponse(success=True, metrics=metrics)
-
+    
     except HTTPException:
         raise
     except Exception as e:
@@ -494,15 +535,17 @@ async def get_health_metrics(
             "Failed to get health metrics",
             extra={
                 "error": str(e),
-                "error_type": type(e).__name__,
-                "user_id": current_user.get("id") if current_user else None,
+                "error_type": type(e).__name__
             },
+            exc_info=True
         )
-        return MetricsResponse(success=False, error="Failed to retrieve metrics")
+        return MetricsResponse(
+            success=False, 
+            error="Failed to retrieve metrics"
+        )
 
 
-# Add a simple ping endpoint
 @router.get("/ping")
 async def ping():
-    """Simple ping endpoint for quick checks."""
+    """Simple ping endpoint for quick checks - never logged."""
     return {"pong": True, "timestamp": datetime.utcnow().isoformat()}

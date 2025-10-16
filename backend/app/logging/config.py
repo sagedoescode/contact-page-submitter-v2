@@ -6,7 +6,7 @@ Supports loading from environment variables, JSON files, and kwargs
 import os
 import json
 from enum import Enum
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 
 
 class LogLevel(str, Enum):
@@ -63,7 +63,6 @@ class LoggingConfig:
         request_logging: Whether to log HTTP requests
     """
 
-    # Configuration file support
     CONFIG_FILE_ENV = "LOG_CONFIG_FILE"
 
     def __init__(self, **kwargs):
@@ -78,20 +77,20 @@ class LoggingConfig:
 
         # Database logging
         self.database_enabled: bool = True
-        self.database_level: LogLevel = LogLevel.INFO
-        self.database_batch_size: int = 50
-        self.database_flush_interval: int = 5  # seconds
+        self.database_level: LogLevel = LogLevel.WARNING
+        self.database_batch_size: int = 100
+        self.database_flush_interval: int = 10
 
         # Buffer settings
         self.buffer_enabled: bool = True
-        self.buffer_size: int = 1000
-        self.buffer_level: LogLevel = LogLevel.DEBUG
+        self.buffer_size: int = 500
+        self.buffer_level: LogLevel = LogLevel.INFO
 
         # Performance settings
         self.async_logging: bool = True
         self.rate_limit_enabled: bool = True
-        self.rate_limit_burst: int = 100
-        self.rate_limit_rate: float = 10.0  # events per second
+        self.rate_limit_burst: int = 1000
+        self.rate_limit_rate: float = 50.0
 
         # Development settings
         self.development_mode: bool = False
@@ -118,6 +117,7 @@ class LoggingConfig:
             self.level = LogLevel.INFO
         elif env in ["production", "prod"]:
             self.level = LogLevel.WARNING
+            self.database_level = LogLevel.WARNING
 
     def _load_from_config_file(self) -> None:
         """Load configuration from JSON file if specified"""
@@ -180,9 +180,9 @@ class LoggingConfig:
                 try:
                     value = converter(os.environ[env_key])
                     setattr(self, attr_name, value)
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError):
                     print(
-                        f"Warning: Invalid value for {env_key}: {os.environ[env_key]}. Using default."
+                        f"Warning: Invalid value for {env_key}: {os.environ[env_key]}"
                     )
 
     def _load_from_kwargs(self, kwargs: Dict[str, Any]) -> None:
@@ -193,7 +193,6 @@ class LoggingConfig:
 
     def _convert_value(self, key: str, value: Any) -> Any:
         """Convert string values to appropriate types"""
-        # Convert boolean values
         if key.endswith("_enabled") or key in [
             "development_mode",
             "request_logging",
@@ -204,7 +203,6 @@ class LoggingConfig:
                 return str(value).lower() in ("true", "1", "yes", "on")
             return bool(value)
 
-        # Convert integer values
         elif key in [
             "database_batch_size",
             "database_flush_interval",
@@ -213,11 +211,9 @@ class LoggingConfig:
         ]:
             return int(value) if isinstance(value, str) else value
 
-        # Convert float values
         elif key in ["rate_limit_rate"]:
             return float(value) if isinstance(value, str) else value
 
-        # Convert LogLevel values
         elif key in [
             "level",
             "console_level",
@@ -231,31 +227,18 @@ class LoggingConfig:
         return value
 
     def _validate(self) -> None:
-        """Validate configuration values and provide warnings"""
-        # Validate rate limit values
+        """Validate configuration values"""
         if self.rate_limit_enabled:
             if self.rate_limit_burst < 1:
-                print(
-                    f"Warning: Invalid rate_limit_burst {self.rate_limit_burst}, setting to 100"
-                )
-                self.rate_limit_burst = 100
+                self.rate_limit_burst = 1000
             if self.rate_limit_rate <= 0:
-                print(
-                    f"Warning: Invalid rate_limit_rate {self.rate_limit_rate}, setting to 10.0"
-                )
-                self.rate_limit_rate = 10.0
+                self.rate_limit_rate = 50.0
 
-        # Validate batch size
         if self.database_batch_size < 1:
-            print(
-                f"Warning: Invalid database_batch_size {self.database_batch_size}, setting to 50"
-            )
-            self.database_batch_size = 50
+            self.database_batch_size = 100
 
-        # Validate buffer size
         if self.buffer_size < 1:
-            print(f"Warning: Invalid buffer_size {self.buffer_size}, setting to 1000")
-            self.buffer_size = 1000
+            self.buffer_size = 500
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization"""
@@ -274,13 +257,11 @@ class LoggingConfig:
         try:
             with open(filepath, "w") as f:
                 f.write(self.to_json())
-            print(f"Configuration saved to {filepath}")
         except Exception as e:
-            print(f"Failed to save configuration to {filepath}: {e}")
+            print(f"Failed to save configuration: {e}")
 
     def __repr__(self) -> str:
         items = [f"{k}={v}" for k, v in self.to_dict().items()]
-        # Show first 5 items for brevity
         display_items = items[:5] if len(items) > 5 else items
         suffix = "..." if len(items) > 5 else ""
         return f"LoggingConfig({', '.join(display_items)}{suffix})"

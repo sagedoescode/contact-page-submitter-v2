@@ -1,8 +1,8 @@
-# app/api/activity.py - Enhanced with comprehensive logging
+# app/api/activity.py - Optimized with focused logging
 from __future__ import annotations
 
 import time
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -15,13 +15,10 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user, get_admin_user
 from app.models.user import User
 
-# Enhanced logging imports
-from app.logging import get_logger, log_function, log_exceptions, log_performance
-from app.logging.core import user_id_var, request_id_var
+from app.logging import get_logger, log_function, log_exceptions
+from app.logging.core import user_id_var
 
 router = APIRouter(prefix="/api/activity", tags=["activity"], redirect_slashes=False)
-
-# Initialize logger
 logger = get_logger(__name__)
 
 
@@ -33,9 +30,7 @@ def get_client_ip(request: Request) -> str:
     real_ip = request.headers.get("X-Real-IP")
     if real_ip:
         return real_ip
-    if request and request.client:
-        return request.client.host
-    return "unknown"
+    return request.client.host if request.client else "unknown"
 
 
 @log_exceptions("resolve_target_user")
@@ -45,26 +40,17 @@ def _resolve_target_user_id(
     user_id: Optional[str],
 ) -> str:
     """Resolve target user ID with admin check"""
-    logger.debug(
-        "Resolving target user ID",
-        context={
-            "current_user_id": str(current_user.id),
-            "requested_user_id": user_id,
-            "is_admin_request": bool(user_id and user_id != str(current_user.id)),
-        },
-    )
-
     target_user_id = str(current_user.id)
+
     if user_id and user_id != target_user_id:
         # Admin check
         get_admin_user(db=db, current_user=current_user)
 
         logger.auth_event(
-            action="admin_view_user_activity",
+            action="admin_view_activity",
             email=current_user.email,
             success=True,
-            admin_id=str(current_user.id),
-            target_user_id=user_id,
+            ip_address=get_client_ip(None),
         )
 
         target_user_id = user_id
@@ -72,7 +58,6 @@ def _resolve_target_user_id(
     return target_user_id
 
 
-@log_performance("build_activity_filters", threshold_ms=50)
 def _build_filters(
     target_user_id: str,
     *,
@@ -85,23 +70,6 @@ def _build_filters(
     date_to: Optional[str],
 ) -> tuple[str, Dict[str, Any]]:
     """Build SQL filters for activity queries"""
-    logger.debug(
-        "Building activity filters",
-        context={
-            "user_id": target_user_id,
-            "filters": {
-                "source": source,
-                "level": level,
-                "action": action,
-                "status": status,
-                "has_search": bool(q),
-                "date_from": date_from,
-                "date_to": date_to,
-            },
-        },
-    )
-
-    # Base WHERE clause for all subqueries
     where_parts = ["user_id = :uid"]
     params: Dict[str, Any] = {"uid": target_user_id}
 
@@ -125,16 +93,13 @@ def _build_filters(
 
     where_clause = " AND ".join(where_parts) if where_parts else "TRUE"
 
-    # App-level filter for level
     app_level_filter = ""
     if level:
         app_level_filter = "AND level = :level"
         params["level"] = level
 
-    # Build the unified query
     base_sql = f"""
         WITH merged AS (
-            -- system logs
             SELECT
                 'system'::text AS source,
                 id::text       AS id,
@@ -152,7 +117,6 @@ def _build_filters(
 
             UNION ALL
 
-            -- app logs
             SELECT
                 'app'::text    AS source,
                 id::text       AS id,
@@ -171,7 +135,6 @@ def _build_filters(
 
             UNION ALL
 
-            -- submission logs
             SELECT
                 'submission'::text AS source,
                 id::text           AS id,
@@ -190,7 +153,6 @@ def _build_filters(
         SELECT * FROM merged
     """
 
-    # Optional source filter
     if source in ("system", "app", "submission"):
         base_sql = f"SELECT * FROM ({base_sql}) AS x WHERE source = :source"
         params["source"] = source
@@ -204,45 +166,22 @@ def activity_stream(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    # scope
     me: bool = Query(True, description="Limit to my own activity"),
     user_id: Optional[str] = Query(
         None, description="Admin: view a specific user's activity"
     ),
-    # filters
     source: Optional[str] = Query(None, pattern="^(system|app|submission)$"),
     level: Optional[str] = Query(None, pattern="^(INFO|WARN|ERROR)$"),
     action: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    q: Optional[str] = Query(None, description="Full-text search over message/details"),
-    # date range
+    q: Optional[str] = Query(None, description="Full-text search"),
     date_from: Optional[str] = Query(None, description="ISO timestamp (inclusive)"),
     date_to: Optional[str] = Query(None, description="ISO timestamp (exclusive)"),
-    # pagination
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=200),
 ):
     """Get activity stream with filtering and pagination"""
-    # Set context
     user_id_var.set(str(current_user.id))
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Activity stream request",
-        context={
-            "user_id": str(current_user.id),
-            "ip": client_ip,
-            "filters": {
-                "source": source,
-                "level": level,
-                "action": action,
-                "status": status,
-                "has_search": bool(q),
-                "date_range": {"from": date_from, "to": date_to},
-            },
-            "pagination": {"page": page, "page_size": page_size},
-        },
-    )
 
     try:
         target_user_id = (
@@ -251,7 +190,6 @@ def activity_stream(
             else _resolve_target_user_id(db, current_user, user_id)
         )
 
-        # Build and execute query
         query_start = time.time()
         base_sql, params = _build_filters(
             target_user_id,
@@ -275,48 +213,15 @@ def activity_stream(
 
         query_time = (time.time() - query_start) * 1000
 
-        # Log database operation
         logger.database_operation(
             operation="SELECT",
             table="activity_logs",
             duration_ms=query_time,
             affected_rows=len(rows),
             success=True,
-            query_type="activity_stream",
-            total_results=total,
-        )
-
-        # Log performance metric
-        logger.performance_metric(
-            name="activity_stream_query",
-            value=query_time,
-            unit="ms",
-            result_count=len(rows),
-            total_count=total,
-            filters_applied=sum(
-                [
-                    bool(source),
-                    bool(level),
-                    bool(action),
-                    bool(status),
-                    bool(q),
-                    bool(date_from),
-                    bool(date_to),
-                ]
-            ),
-        )
-
-        logger.info(
-            f"Activity stream retrieved: {len(rows)} items",
-            context={
-                "user_id": str(current_user.id),
-                "target_user_id": target_user_id,
-                "is_admin_view": target_user_id != str(current_user.id),
-                "results": len(rows),
-                "total": total,
-                "page": page,
-                "query_time_ms": query_time,
-            },
+            page=page,
+            page_size=page_size,
+            total=total,
         )
 
         return {
@@ -327,40 +232,28 @@ def activity_stream(
             "pages": (total + page_size - 1) // page_size,
         }
 
-    except HTTPException as e:
-        logger.warning(
-            f"Activity stream request failed: {e.detail}",
-            context={"user_id": str(current_user.id), "status_code": e.status_code},
-        )
+    except HTTPException:
         raise
     except Exception as e:
         db.rollback()
         logger.exception(
             e,
             handled=False,
-            context={
-                "endpoint": "/activity/stream",
-                "user_id": str(current_user.id),
-                "filters": {"source": source, "level": level},
-            },
+            context={"endpoint": "/activity/stream"},
         )
-        raise HTTPException(
-            status_code=500, detail=f"Failed to fetch activity: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail="Failed to fetch activity")
 
 
 @router.get("/export")
-@log_function("export_activity_csv", log_result=True)
+@log_function("export_activity_csv")
 def export_activity_csv(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    # scope
     me: bool = Query(True, description="Limit to my own activity"),
     user_id: Optional[str] = Query(
         None, description="Admin: view a specific user's activity"
     ),
-    # filters (same as /stream)
     source: Optional[str] = Query(None, pattern="^(system|app|submission)$"),
     level: Optional[str] = Query(None, pattern="^(INFO|WARN|ERROR)$"),
     action: Optional[str] = Query(None),
@@ -370,27 +263,7 @@ def export_activity_csv(
     date_to: Optional[str] = Query(None),
 ):
     """Export activity to CSV file"""
-    # Set context
     user_id_var.set(str(current_user.id))
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Activity export request",
-        context={
-            "user_id": str(current_user.id),
-            "ip": client_ip,
-            "export_format": "csv",
-            "filters": {
-                "source": source,
-                "level": level,
-                "action": action,
-                "status": status,
-                "has_search": bool(q),
-                "date_from": date_from,
-                "date_to": date_to,
-            },
-        },
-    )
 
     try:
         target_user_id = (
@@ -399,7 +272,6 @@ def export_activity_csv(
             else _resolve_target_user_id(db, current_user, user_id)
         )
 
-        # Build and execute export query
         export_start = time.time()
         base_sql, params = _build_filters(
             target_user_id,
@@ -418,15 +290,13 @@ def export_activity_csv(
 
         logger.database_operation(
             operation="SELECT",
-            table="activity_logs_export",
+            table="activity_logs",
             duration_ms=export_query_time,
             affected_rows=len(rows),
             success=True,
-            query_type="export",
         )
 
         # Build CSV
-        csv_start = time.time()
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(
@@ -461,32 +331,14 @@ def export_activity_csv(
             )
 
         output.seek(0)
-        csv_generation_time = (time.time() - csv_start) * 1000
-
         filename = f"activity_{dt.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.csv"
         file_size = len(output.getvalue())
 
-        # Log export metrics
         logger.performance_metric(
-            name="activity_export_size",
+            name="activity_export",
             value=file_size,
             unit="bytes",
             row_count=len(rows),
-            filename=filename,
-        )
-
-        logger.info(
-            f"Activity exported: {len(rows)} rows",
-            context={
-                "user_id": str(current_user.id),
-                "target_user_id": target_user_id,
-                "export_format": "csv",
-                "filename": filename,
-                "row_count": len(rows),
-                "file_size_bytes": file_size,
-                "query_time_ms": export_query_time,
-                "csv_generation_ms": csv_generation_time,
-            },
         )
 
         return StreamingResponse(
@@ -500,15 +352,9 @@ def export_activity_csv(
         logger.exception(
             e,
             handled=False,
-            context={
-                "endpoint": "/activity/export",
-                "export_format": "csv",
-                "user_id": str(current_user.id),
-            },
+            context={"endpoint": "/activity/export"},
         )
-        raise HTTPException(
-            status_code=500, detail=f"Failed to export activity: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail="Failed to export activity")
 
 
 @router.get("/stats")
@@ -517,12 +363,10 @@ def activity_stats(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    # scope
     me: bool = Query(True, description="Limit to my own activity"),
     user_id: Optional[str] = Query(
         None, description="Admin: view a specific user's activity"
     ),
-    # optional date window (ISO strings)
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
 ):
@@ -535,19 +379,7 @@ def activity_stats(
         else _resolve_target_user_id(db, current_user, user_id)
     )
 
-    logger.info(
-        "Activity stats request",
-        context={
-            "user_id": str(current_user.id),
-            "target_user_id": target_user_id,
-            "date_from": date_from,
-            "date_to": date_to,
-            "ip": get_client_ip(request),
-        },
-    )
-
     try:
-        # Build base where/time filter
         parts = ["user_id = :uid"]
         params: Dict[str, Any] = {"uid": target_user_id}
         if date_from:
@@ -558,7 +390,6 @@ def activity_stats(
             params["date_to"] = date_to
         where = " AND ".join(parts)
 
-        # Query stats by source
         stats_start = time.time()
 
         sql_by_source = f"""
@@ -589,10 +420,9 @@ def activity_stats(
 
         logger.database_operation(
             operation="AGGREGATE",
-            table="logs,system_logs,submission_logs",
+            table="logs",
             duration_ms=stats_time,
             success=True,
-            query_type="activity_statistics",
         )
 
         stats_data = {
@@ -608,33 +438,6 @@ def activity_stats(
             },
         }
 
-        # Calculate totals and metrics
-        total_logs = sum(stats_data["by_source"].values())
-        error_rate = (
-            (stats_data["by_level"]["ERROR"] / total_logs * 100)
-            if total_logs > 0
-            else 0
-        )
-
-        logger.performance_metric(
-            name="activity_stats_query_time",
-            value=stats_time,
-            unit="ms",
-            total_logs=total_logs,
-        )
-
-        logger.info(
-            f"Activity stats retrieved",
-            context={
-                "user_id": str(current_user.id),
-                "target_user_id": target_user_id,
-                "date_range": {"from": date_from, "to": date_to},
-                "total_logs": total_logs,
-                "error_rate_percent": error_rate,
-                "query_time_ms": stats_time,
-            },
-        )
-
         return stats_data
 
     except Exception as e:
@@ -642,7 +445,7 @@ def activity_stats(
         logger.exception(
             e,
             handled=True,
-            context={"endpoint": "/activity/stats", "user_id": str(current_user.id)},
+            context={"endpoint": "/activity/stats"},
         )
         return {
             "by_source": {"system": 0, "app": 0, "submission": 0},

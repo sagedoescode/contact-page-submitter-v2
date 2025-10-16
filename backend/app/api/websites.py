@@ -1,4 +1,4 @@
-# app/api/websites.py - Website management API with comprehensive logging
+# app/api/websites.py - Website management API with optimized logging
 from __future__ import annotations
 
 import time
@@ -15,7 +15,7 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.services.log_service import LogService as ApplicationInsightsLogger
-from app.logging import get_logger, log_function, log_exceptions
+from app.logging import get_logger, log_function
 from app.logging.core import request_id_var, user_id_var, campaign_id_var
 
 # Initialize structured logger
@@ -72,59 +72,34 @@ class WebsiteUpdateRequest(BaseModel):
 
 
 def get_client_ip(request: Request) -> str:
-    """Extract client IP address from request headers with logging"""
+    """Extract client IP address from request headers"""
+    if not request:
+        return "unknown"
+
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        ip = forwarded_for.split(",")[0].strip()
-        logger.debug(f"Client IP extracted from X-Forwarded-For: {ip}")
-        return ip
+        return forwarded_for.split(",")[0].strip()
 
     real_ip = request.headers.get("X-Real-IP")
     if real_ip:
-        logger.debug(f"Client IP extracted from X-Real-IP: {real_ip}")
         return real_ip
 
-    if request and request.client:
-        ip = request.client.host
-        logger.debug(f"Client IP extracted from request.client: {ip}")
-        return ip
-
-    logger.warning("Unable to determine client IP address")
-    return "unknown"
+    return request.client.host if request.client else "unknown"
 
 
 @router.post("/", response_model=WebsiteResponse)
 @log_function("create_website")
-def create_website(
+async def create_website(
     request: Request,
     website_data: WebsiteCreateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Create a new website"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
     campaign_id_var.set(website_data.campaign_id)
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(
-        user_id=str(current_user.id), campaign_id=website_data.campaign_id
-    )
-
-    client_ip = get_client_ip(request)
     website_id = str(uuid.uuid4())
-
-    logger.info(
-        "Website creation started",
-        context={
-            "user_id": str(current_user.id),
-            "campaign_id": website_data.campaign_id,
-            "website_id": website_id,
-            "client_ip": client_ip,
-            "domain": website_data.domain,
-            "contact_url": website_data.contact_url,
-        },
-    )
 
     try:
         # Verify campaign belongs to user
@@ -148,19 +123,9 @@ def create_website(
         )
 
         if not campaign_exists:
-            logger.warning(
-                "Campaign not found for website creation",
-                context={
-                    "user_id": str(current_user.id),
-                    "campaign_id": website_data.campaign_id,
-                },
-            )
-
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found"
             )
-
-        create_start = time.time()
 
         # Create website record
         insert_query = text(
@@ -188,16 +153,6 @@ def create_website(
         db.execute(insert_query, params)
         db.commit()
 
-        create_time = (time.time() - create_start) * 1000
-
-        logger.database_operation(
-            operation="INSERT",
-            table="websites",
-            duration_ms=create_time,
-            affected_rows=1,
-            success=True,
-        )
-
         # Fetch the created website
         select_query = text(
             """
@@ -215,27 +170,14 @@ def create_website(
             if hasattr(value, "isoformat"):
                 website_dict[key] = value.isoformat()
 
+        # Only log website creation for audit
         logger.info(
-            "Website created successfully",
-            context={
-                "user_id": str(current_user.id),
-                "campaign_id": website_data.campaign_id,
-                "website_id": website_id,
-                "domain": website_data.domain,
-                "create_duration_ms": create_time,
-            },
-        )
-
-        # Track business events
-        app_logger.track_business_event(
-            event_name="website_created",
-            properties={
+            "Website created",
+            extra={
                 "website_id": website_id,
                 "campaign_id": website_data.campaign_id,
                 "domain": website_data.domain,
-                "user_id": str(current_user.id),
             },
-            metrics={"create_time_ms": create_time},
         )
 
         return WebsiteResponse(**website_dict)
@@ -244,20 +186,16 @@ def create_website(
         raise
     except SQLAlchemyError as e:
         db.rollback()
-
         logger.error(
             "Database error during website creation",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "campaign_id": website_data.campaign_id,
                 "website_id": website_id,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create website",
@@ -265,8 +203,7 @@ def create_website(
 
 
 @router.get("/", response_model=List[WebsiteResponse])
-@log_function("get_websites")
-def get_websites(
+async def get_websites(
     request: Request,
     campaign_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None),
@@ -276,31 +213,11 @@ def get_websites(
     current_user: User = Depends(get_current_user),
 ):
     """Get websites for the current user"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
     if campaign_id:
         campaign_id_var.set(campaign_id)
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id), campaign_id=campaign_id)
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Websites list request started",
-        context={
-            "user_id": str(current_user.id),
-            "client_ip": client_ip,
-            "campaign_id": campaign_id,
-            "status_filter": status_filter,
-            "page": page,
-            "page_size": page_size,
-        },
-    )
-
     try:
-        query_start = time.time()
-
         # Build query with filters
         where_parts = ["user_id = :user_id"]
         params = {"user_id": str(current_user.id)}
@@ -337,15 +254,6 @@ def get_websites(
         params.update({"limit": page_size, "offset": (page - 1) * page_size})
 
         websites_result = db.execute(data_query, params).mappings().all()
-        query_time = (time.time() - query_start) * 1000
-
-        logger.database_operation(
-            operation="SELECT",
-            table="websites",
-            duration_ms=query_time,
-            affected_rows=len(websites_result),
-            success=True,
-        )
 
         # Convert results
         websites = []
@@ -356,44 +264,19 @@ def get_websites(
                     website_dict[key] = value.isoformat()
             websites.append(WebsiteResponse(**website_dict))
 
-        logger.info(
-            "Websites retrieved successfully",
-            context={
-                "user_id": str(current_user.id),
-                "websites_found": len(websites),
-                "total_websites": total,
-                "query_duration_ms": query_time,
-                "page": page,
-                "page_size": page_size,
-            },
-        )
-
-        # Track metrics
-        app_logger.track_metric(
-            name="websites_query_performance",
-            value=query_time,
-            properties={
-                "result_count": len(websites),
-                "total_count": total,
-                "has_campaign_filter": bool(campaign_id),
-                "has_status_filter": bool(status_filter),
-            },
-        )
+        # No logging for routine list operations
 
         return websites
 
     except SQLAlchemyError as e:
         logger.error(
             "Database error retrieving websites",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve websites",
@@ -401,34 +284,16 @@ def get_websites(
 
 
 @router.get("/{website_id}", response_model=WebsiteResponse)
-@log_function("get_website")
-def get_website(
+async def get_website(
     website_id: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get a specific website by ID"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Website details request started",
-        context={
-            "user_id": str(current_user.id),
-            "website_id": website_id,
-            "client_ip": client_ip,
-        },
-    )
-
     try:
-        query_start = time.time()
-
         select_query = text(
             """
             SELECT * FROM websites 
@@ -445,22 +310,7 @@ def get_website(
             .first()
         )
 
-        query_time = (time.time() - query_start) * 1000
-
-        logger.database_operation(
-            operation="SELECT",
-            table="websites",
-            duration_ms=query_time,
-            affected_rows=1 if website_result else 0,
-            success=True,
-        )
-
         if not website_result:
-            logger.warning(
-                "Website not found",
-                context={"user_id": str(current_user.id), "website_id": website_id},
-            )
-
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Website not found"
             )
@@ -475,28 +325,7 @@ def get_website(
         if website_dict.get("campaign_id"):
             campaign_id_var.set(website_dict["campaign_id"])
 
-        logger.info(
-            "Website details retrieved successfully",
-            context={
-                "user_id": str(current_user.id),
-                "website_id": website_id,
-                "campaign_id": website_dict.get("campaign_id"),
-                "domain": website_dict.get("domain"),
-                "status": website_dict.get("status"),
-                "query_duration_ms": query_time,
-            },
-        )
-
-        # Track business event
-        app_logger.track_user_action(
-            action="view_website",
-            target=website_id,
-            properties={
-                "domain": website_dict.get("domain"),
-                "status": website_dict.get("status"),
-                "has_captcha": website_dict.get("has_captcha"),
-            },
-        )
+        # No logging for routine retrieval
 
         return WebsiteResponse(**website_dict)
 
@@ -505,16 +334,13 @@ def get_website(
     except SQLAlchemyError as e:
         logger.error(
             "Database error retrieving website",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "website_id": website_id,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve website",
@@ -523,7 +349,7 @@ def get_website(
 
 @router.put("/{website_id}", response_model=WebsiteResponse)
 @log_function("update_website")
-def update_website(
+async def update_website(
     website_id: str,
     website_data: WebsiteUpdateRequest,
     request: Request,
@@ -531,30 +357,13 @@ def update_website(
     current_user: User = Depends(get_current_user),
 ):
     """Update a website"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    # Track what fields are being updated
-    updated_data = website_data.model_dump(exclude_unset=True)
-    updated_fields = [k for k, v in updated_data.items() if v is not None]
-
-    logger.info(
-        "Website update request started",
-        context={
-            "user_id": str(current_user.id),
-            "website_id": website_id,
-            "client_ip": client_ip,
-            "fields_to_update": updated_fields,
-            "update_count": len(updated_fields),
-        },
-    )
-
     try:
+        # Track what fields are being updated
+        updated_data = website_data.model_dump(exclude_unset=True)
+        updated_fields = [k for k, v in updated_data.items() if v is not None]
+
         # First, verify website exists and belongs to user
         check_query = text(
             """
@@ -572,11 +381,6 @@ def update_website(
         )
 
         if not existing_website:
-            logger.warning(
-                "Website not found for update",
-                context={"user_id": str(current_user.id), "website_id": website_id},
-            )
-
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Website not found"
             )
@@ -586,7 +390,6 @@ def update_website(
             campaign_id_var.set(existing_website["campaign_id"])
 
         # Build update query
-        update_start = time.time()
         update_parts = []
         params = {"website_id": website_id, "user_id": str(current_user.id)}
 
@@ -613,16 +416,6 @@ def update_website(
             db.execute(update_query, params)
             db.commit()
 
-        update_time = (time.time() - update_start) * 1000
-
-        logger.database_operation(
-            operation="UPDATE",
-            table="websites",
-            duration_ms=update_time,
-            affected_rows=1,
-            success=True,
-        )
-
         # Fetch updated website
         select_query = text(
             """
@@ -646,31 +439,20 @@ def update_website(
             if hasattr(value, "isoformat"):
                 website_dict[key] = value.isoformat()
 
-        logger.info(
-            "Website updated successfully",
-            context={
-                "user_id": str(current_user.id),
-                "website_id": website_id,
-                "fields_updated": updated_fields,
-                "update_duration_ms": update_time,
-            },
-        )
-
-        # Track business event
-        app_logger.track_business_event(
-            event_name="website_updated",
-            properties={
-                "website_id": website_id,
-                "domain": existing_website["domain"],
-                "fields_updated": updated_fields,
-                "previous_status": existing_website["status"],
-                "new_status": website_dict.get("status"),
-            },
-            metrics={
-                "update_time_ms": update_time,
-                "fields_changed": len(updated_fields),
-            },
-        )
+        # Only log significant status changes
+        if "status" in updated_fields and website_dict["status"] in [
+            "completed",
+            "failed",
+        ]:
+            logger.info(
+                f"Website {website_dict['status']}",
+                extra={
+                    "website_id": website_id,
+                    "domain": existing_website["domain"],
+                    "previous_status": existing_website["status"],
+                    "new_status": website_dict["status"],
+                },
+            )
 
         return WebsiteResponse(**website_dict)
 
@@ -678,20 +460,15 @@ def update_website(
         raise
     except SQLAlchemyError as e:
         db.rollback()
-
         logger.error(
             "Database error updating website",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "website_id": website_id,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
-                "fields_being_updated": updated_fields,
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update website",
@@ -700,33 +477,16 @@ def update_website(
 
 @router.delete("/{website_id}")
 @log_function("delete_website")
-def delete_website(
+async def delete_website(
     website_id: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Delete a website"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Website deletion request started",
-        context={
-            "user_id": str(current_user.id),
-            "website_id": website_id,
-            "client_ip": client_ip,
-        },
-    )
-
     try:
-        delete_start = time.time()
-
         # First, verify website exists and get details for logging
         check_query = text(
             """
@@ -744,11 +504,6 @@ def delete_website(
         )
 
         if not existing_website:
-            logger.warning(
-                "Website not found for deletion",
-                context={"user_id": str(current_user.id), "website_id": website_id},
-            )
-
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Website not found"
             )
@@ -780,40 +535,16 @@ def delete_website(
         )
 
         db.commit()
-        delete_time = (time.time() - delete_start) * 1000
 
-        logger.database_operation(
-            operation="DELETE",
-            table="websites",
-            duration_ms=delete_time,
-            affected_rows=result.rowcount,
-            success=True,
-        )
-
+        # Log deletion for audit trail
         logger.info(
-            "Website deleted successfully",
-            context={
-                "user_id": str(current_user.id),
+            "Website deleted",
+            extra={
                 "website_id": website_id,
                 "domain": existing_website["domain"],
-                "submissions_deleted": submissions_deleted,
-                "delete_duration_ms": delete_time,
-            },
-        )
-
-        # Track business event
-        app_logger.track_business_event(
-            event_name="website_deleted",
-            properties={
-                "website_id": website_id,
-                "domain": existing_website["domain"],
-                "status": existing_website["status"],
                 "campaign_id": existing_website["campaign_id"],
-                "had_submissions": submissions_deleted > 0,
-            },
-            metrics={
-                "delete_time_ms": delete_time,
                 "submissions_deleted": submissions_deleted,
+                "ip": get_client_ip(request),
             },
         )
 
@@ -823,19 +554,15 @@ def delete_website(
         raise
     except SQLAlchemyError as e:
         db.rollback()
-
         logger.error(
             "Database error deleting website",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "website_id": website_id,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete website",
@@ -843,35 +570,17 @@ def delete_website(
 
 
 @router.get("/campaign/{campaign_id}/stats")
-@log_function("get_campaign_website_stats")
-def get_campaign_website_stats(
+async def get_campaign_website_stats(
     campaign_id: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get website statistics for a campaign"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
     campaign_id_var.set(campaign_id)
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id), campaign_id=campaign_id)
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Campaign website stats request started",
-        context={
-            "user_id": str(current_user.id),
-            "campaign_id": campaign_id,
-            "client_ip": client_ip,
-        },
-    )
-
     try:
-        stats_start = time.time()
-
         # Verify campaign belongs to user
         campaign_check = text(
             """
@@ -890,11 +599,6 @@ def get_campaign_website_stats(
         )
 
         if not campaign_exists:
-            logger.warning(
-                "Campaign not found for stats",
-                context={"user_id": str(current_user.id), "campaign_id": campaign_id},
-            )
-
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found"
             )
@@ -928,14 +632,6 @@ def get_campaign_website_stats(
         stats_result = (
             db.execute(stats_query, {"campaign_id": campaign_id}).mappings().all()
         )
-        stats_time = (time.time() - stats_start) * 1000
-
-        logger.database_operation(
-            operation="AGGREGATE",
-            table="websites",
-            duration_ms=stats_time,
-            success=True,
-        )
 
         # Process results
         stats = {}
@@ -947,25 +643,20 @@ def get_campaign_website_stats(
                 "requires_proxy": row["requires_proxy"],
             }
 
-        logger.info(
-            "Campaign website stats retrieved",
-            context={
-                "user_id": str(current_user.id),
-                "campaign_id": campaign_id,
-                "total_websites": stats.get("total", {}).get("count", 0),
-                "stats_duration_ms": stats_time,
-            },
-        )
+        # Only log if high failure rate
+        total_count = stats.get("total", {}).get("count", 0)
+        failed_count = stats.get("failed", {}).get("count", 0)
 
-        # Track business event
-        app_logger.track_business_event(
-            event_name="campaign_website_stats_viewed",
-            properties={"campaign_id": campaign_id, "user_id": str(current_user.id)},
-            metrics={
-                "query_time_ms": stats_time,
-                "total_websites": stats.get("total", {}).get("count", 0),
-            },
-        )
+        if total_count > 0 and (failed_count / total_count) > 0.3:
+            logger.warning(
+                "High website failure rate",
+                extra={
+                    "campaign_id": campaign_id,
+                    "total_websites": total_count,
+                    "failed_websites": failed_count,
+                    "failure_rate": round((failed_count / total_count) * 100, 2),
+                },
+            )
 
         return {"stats": stats}
 
@@ -974,16 +665,13 @@ def get_campaign_website_stats(
     except SQLAlchemyError as e:
         logger.error(
             "Database error retrieving website stats",
-            context={
-                "user_id": str(current_user.id),
+            extra={
                 "campaign_id": campaign_id,
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-
-        app_logger.track_exception(e, handled=True)
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve website statistics",

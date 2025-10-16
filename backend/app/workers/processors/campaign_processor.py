@@ -1,762 +1,684 @@
-# app/workers/campaign_processor.py - Enhanced Campaign Processor with Real Browser Automation
-"""
-Campaign processor that handles form submissions using Playwright
-"""
-import sys
-import os
-import time
-import logging
-import json
-import traceback
-import asyncio
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+# app/workers/processors/campaign_processor.py - FIXED VERSION WITH MAIN ENTRY POINT
+"""Campaign processor with enhanced browser automation integration."""
 
-# Setup logging
+import os
+import sys
+import asyncio
+import logging
+from typing import Optional, Dict
+from datetime import datetime
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+from typing import Optional, Dict, Any
+
+# Load .env file
+load_dotenv()
+
+# Configure logging with more detailed format
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="[%(asctime)s] [PROCESSOR] [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("campaign_processor.log", mode="a"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Get DATABASE_URL from .env
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-try:
-    from sqlalchemy import create_engine, text
-    from sqlalchemy.orm import sessionmaker
-    from playwright.async_api import (
-        async_playwright,
-        Page,
-        Browser,
-        BrowserContext,
-        TimeoutError as PlaywrightTimeout,
-    )
-    from app.workers.config.browser_config import BrowserConfig
-except ImportError as e:
-    logger.error(f"Required modules not installed: {e}")
-    logger.error("Install with: pip install sqlalchemy playwright")
-    logger.error("Then run: playwright install chromium")
+if not DATABASE_URL:
+    logger.error("FATAL: DATABASE_URL not in .env file!")
     sys.exit(1)
 
-
-class FormSubmitter:
-    """Handles actual form submission using Playwright"""
-
-    def __init__(self, browser_config: BrowserConfig):
-        self.config = browser_config
-        self.browser = None
-        self.context = None
-        self.playwright = None
-
-    async def initialize(self):
-        """Initialize Playwright browser"""
-        try:
-            self.playwright = await async_playwright().start()
-
-            # Launch browser based on config
-            if self.config.browser_type == "firefox":
-                self.browser = await self.playwright.firefox.launch(
-                    **self.config.to_playwright_args()
-                )
-            elif self.config.browser_type == "webkit":
-                self.browser = await self.playwright.webkit.launch(
-                    **self.config.to_playwright_args()
-                )
-            else:
-                self.browser = await self.playwright.chromium.launch(
-                    **self.config.to_playwright_args()
-                )
-
-            # Create context with config
-            self.context = await self.browser.new_context(
-                **self.config.to_context_args()
-            )
-
-            logger.info(f"Browser initialized: {self.config.browser_type}")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize browser: {e}")
-            raise
-
-    async def cleanup(self):
-        """Clean up browser resources"""
-        try:
-            if self.context:
-                await self.context.close()
-            if self.browser:
-                await self.browser.close()
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-
-    async def find_contact_form(self, page: Page) -> Optional[Dict[str, Any]]:
-        """Find contact form on the page"""
-        try:
-            # Common form selectors
-            form_selectors = [
-                'form[id*="contact"]',
-                'form[class*="contact"]',
-                'form[id*="message"]',
-                'form[class*="message"]',
-                'form[action*="contact"]',
-                'form[action*="submit"]',
-                "#contact-form",
-                ".contact-form",
-                'form[method="post"]',
-                "form",  # Last resort - any form
-            ]
-
-            for selector in form_selectors:
-                form = await page.query_selector(selector)
-                if form:
-                    # Check if it has input fields
-                    inputs = await form.query_selector_all(
-                        'input[type="text"], input[type="email"], textarea'
-                    )
-                    if len(inputs) > 0:
-                        logger.info(f"Found form with selector: {selector}")
-                        return {
-                            "selector": selector,
-                            "element": form,
-                            "input_count": len(inputs),
-                        }
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Error finding form: {e}")
-            return None
-
-    async def fill_form(
-        self, page: Page, form_info: Dict[str, Any], message: str
-    ) -> bool:
-        """Fill out the contact form"""
-        try:
-            form = form_info["element"]
-
-            # Common field mappings
-            field_mappings = {
-                "name": ["name", "full_name", "your_name", "fullname", "contact_name"],
-                "email": [
-                    "email",
-                    "e-mail",
-                    "emailaddress",
-                    "email_address",
-                    "your_email",
-                ],
-                "subject": ["subject", "title", "topic", "regarding"],
-                "message": [
-                    "message",
-                    "comment",
-                    "comments",
-                    "inquiry",
-                    "details",
-                    "body",
-                    "content",
-                ],
-                "phone": ["phone", "telephone", "mobile", "number", "contact_number"],
-            }
-
-            filled_fields = 0
-
-            # Fill name field
-            for field_name in field_mappings["name"]:
-                name_field = await form.query_selector(
-                    f'input[name*="{field_name}" i], input[id*="{field_name}" i]'
-                )
-                if name_field:
-                    await name_field.fill("John Smith")
-                    filled_fields += 1
-                    break
-
-            # Fill email field
-            for field_name in field_mappings["email"]:
-                email_field = await form.query_selector(
-                    f'input[name*="{field_name}" i], input[id*="{field_name}" i], input[type="email"]'
-                )
-                if email_field:
-                    await email_field.fill("contact@example.com")
-                    filled_fields += 1
-                    break
-
-            # Fill subject field if exists
-            for field_name in field_mappings["subject"]:
-                subject_field = await form.query_selector(
-                    f'input[name*="{field_name}" i], input[id*="{field_name}" i]'
-                )
-                if subject_field:
-                    await subject_field.fill("Business Inquiry")
-                    filled_fields += 1
-                    break
-
-            # Fill message field
-            for field_name in field_mappings["message"]:
-                message_field = await form.query_selector(
-                    f'textarea[name*="{field_name}" i], textarea[id*="{field_name}" i], textarea'
-                )
-                if message_field:
-                    await message_field.fill(message)
-                    filled_fields += 1
-                    break
-
-            logger.info(f"Filled {filled_fields} form fields")
-            return filled_fields >= 2  # At least email and message
-
-        except Exception as e:
-            logger.error(f"Error filling form: {e}")
-            return False
-
-    async def handle_captcha(self, page: Page) -> bool:
-        """Check for and handle CAPTCHA (placeholder for integration)"""
-        try:
-            # Check for common CAPTCHA indicators
-            captcha_indicators = [
-                '[class*="recaptcha"]',
-                '[id*="recaptcha"]',
-                '[class*="captcha"]',
-                '[id*="captcha"]',
-                'iframe[src*="recaptcha"]',
-                'iframe[src*="hcaptcha"]',
-            ]
-
-            for selector in captcha_indicators:
-                captcha = await page.query_selector(selector)
-                if captcha:
-                    logger.warning("CAPTCHA detected on page")
-                    # Here you would integrate with a CAPTCHA solving service
-                    # For now, we'll return False
-                    return False
-
-            return True  # No CAPTCHA found
-
-        except Exception as e:
-            logger.error(f"Error checking for CAPTCHA: {e}")
-            return True  # Continue anyway
-
-    async def submit_form(self, page: Page, form_info: Dict[str, Any]) -> bool:
-        """Submit the form"""
-        try:
-            form = form_info["element"]
-
-            # Look for submit button
-            submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
-                'button[class*="submit"]',
-                'button[id*="submit"]',
-                'button[name*="submit"]',
-                "button",  # Last resort
-            ]
-
-            submit_button = None
-            for selector in submit_selectors:
-                submit_button = await form.query_selector(selector)
-                if submit_button:
-                    break
-
-            if not submit_button:
-                # Try page-wide search
-                for selector in submit_selectors:
-                    submit_button = await page.query_selector(selector)
-                    if submit_button:
-                        break
-
-            if submit_button:
-                # Click submit button
-                await submit_button.click()
-
-                # Wait for navigation or response
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except PlaywrightTimeout:
-                    pass  # Page might not navigate
-
-                # Check for success indicators
-                success_indicators = [
-                    "thank you",
-                    "success",
-                    "received",
-                    "submitted",
-                    "we will get back",
-                ]
-
-                page_content = await page.content()
-                page_text = page_content.lower()
-
-                for indicator in success_indicators:
-                    if indicator in page_text:
-                        logger.info(f"Success indicator found: {indicator}")
-                        return True
-
-                # Check if form is no longer visible (might indicate success)
-                form_still_visible = await page.query_selector(form_info["selector"])
-                if not form_still_visible:
-                    logger.info("Form no longer visible after submission")
-                    return True
-
-                return True  # Assume success if no error
-
-            logger.warning("No submit button found")
-            return False
-
-        except Exception as e:
-            logger.error(f"Error submitting form: {e}")
-            return False
-
-    async def process_url(self, url: str, message: str) -> Dict[str, Any]:
-        """Process a single URL - find form, fill it, and submit"""
-        result = {
-            "success": False,
-            "error": None,
-            "form_found": False,
-            "form_filled": False,
-            "form_submitted": False,
-            "has_captcha": False,
-        }
-
-        page = None
-        try:
-            # Create new page for this submission
-            page = await self.context.new_page()
-
-            # Navigate to URL with timeout
-            try:
-                await page.goto(
-                    url,
-                    wait_until="networkidle",
-                    timeout=self.config.navigation_timeout,
-                )
-            except PlaywrightTimeout:
-                await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=self.config.navigation_timeout,
-                )
-
-            logger.info(f"Navigated to {url}")
-
-            # Find contact form
-            form_info = await self.find_contact_form(page)
-            if not form_info:
-                # Try to find contact page link
-                contact_link = await page.query_selector(
-                    'a[href*="contact"], a:has-text("Contact")'
-                )
-                if contact_link:
-                    await contact_link.click()
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                    form_info = await self.find_contact_form(page)
-
-            if not form_info:
-                result["error"] = "No contact form found"
-                return result
-
-            result["form_found"] = True
-
-            # Check for CAPTCHA
-            has_captcha = not await self.handle_captcha(page)
-            result["has_captcha"] = has_captcha
-
-            if (
-                has_captcha and not self.config.ignore_https_errors
-            ):  # Using as proxy for "strict mode"
-                result["error"] = "CAPTCHA detected"
-                return result
-
-            # Fill form
-            form_filled = await self.fill_form(page, form_info, message)
-            if not form_filled:
-                result["error"] = "Failed to fill form fields"
-                return result
-
-            result["form_filled"] = True
-
-            # Submit form
-            form_submitted = await self.submit_form(page, form_info)
-            result["form_submitted"] = form_submitted
-            result["success"] = form_submitted
-
-            if not form_submitted:
-                result["error"] = "Form submission failed"
-
-            # Take screenshot for debugging (optional)
-            if os.getenv("SAVE_SCREENSHOTS", "false").lower() == "true":
-                await page.screenshot(path=f'screenshots/{url.replace("/", "_")}.png')
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Error processing URL {url}: {e}")
-            result["error"] = str(e)
-            return result
-
-        finally:
-            if page:
-                await page.close()
+logger.info(f"Database configured from .env")
 
 
-class CampaignProcessor:
-    """Process campaign submissions with real browser automation"""
+def get_db_session():
+    """Create database session from .env DATABASE_URL."""
+    try:
+        engine = create_engine(DATABASE_URL, echo=False)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        return SessionLocal()
+    except Exception as e:
+        logger.error(f"Failed to create DB session: {e}")
+        return None
 
-    def __init__(self, campaign_id: str, user_id: str, db_url: Optional[str] = None):
-        self.campaign_id = campaign_id
-        self.user_id = user_id
-        self.db_url = db_url or os.getenv("DATABASE_URL", "sqlite:///./app.db")
 
-        # Setup database
-        self.engine = create_engine(self.db_url)
-        self.SessionLocal = sessionmaker(
-            autocommit=False, autoflush=False, bind=self.engine
+def get_user_profile(db, user_id: str) -> Dict:
+    """Fetch user profile from database for form filling."""
+    try:
+        query = text(
+            """
+            SELECT 
+                u.first_name, u.last_name, u.email,
+                up.phone_number, up.company_name, up.job_title,
+                up.message, up.subject, up.website_url
+            FROM users u
+            LEFT JOIN user_profiles up ON u.id = up.user_id
+            WHERE u.id = :user_id
+        """
         )
 
-        # Browser config
-        self.browser_config = BrowserConfig.from_environment()
-        self.form_submitter = FormSubmitter(self.browser_config)
+        result = db.execute(query, {"user_id": user_id}).mappings().first()
 
-        # Processing state
-        self.is_running = True
-        self.processed_count = 0
-        self.success_count = 0
-        self.failed_count = 0
+        if result:
+            return {
+                "first_name": result["first_name"] or "User",
+                "last_name": result["last_name"] or "",
+                "email": result["email"] or "contact@example.com",
+                "phone_number": result["phone_number"] or "",
+                "company_name": result["company_name"] or "",
+                "job_title": result["job_title"] or "",
+                "message": result["message"]
+                or "I would like to discuss business opportunities.",
+                "subject": result["subject"] or "Business Inquiry",
+                "website_url": result["website_url"] or "",
+            }
+    except Exception as e:
+        logger.warning(f"Could not fetch user profile: {e}")
 
-        logger.info(f"Initialized processor for campaign {campaign_id}")
+    # Default profile if user not found
+    return {
+        "first_name": "User",
+        "last_name": "",
+        "email": "contact@example.com",
+        "phone_number": "",
+        "company_name": "",
+        "job_title": "",
+        "message": "I would like to discuss business opportunities.",
+        "subject": "Business Inquiry",
+        "website_url": "",
+    }
 
-    def get_db(self):
-        """Get database session"""
-        return self.SessionLocal()
 
-    async def process_submission(
-        self, submission: Dict[str, Any], message: str
-    ) -> Dict[str, Any]:
-        """Process a single submission using browser automation"""
-        url = submission.get("url")
-        logger.info(f"Processing submission {submission['id']} for URL: {url}")
+def process_campaign_submissions(campaign_id: str, user_id: str):
+    """Main entry point - process all submissions for a campaign."""
+    logger.info("=" * 70)
+    logger.info("CAMPAIGN PROCESSOR STARTED")
+    logger.info(f"Campaign: {campaign_id[:8]}... | User: {user_id[:8]}...")
+    logger.info("=" * 70)
 
-        # Process with browser
-        result = await self.form_submitter.process_url(url, message)
+    db = get_db_session()
+    if not db:
+        logger.error("Failed to get database session")
+        return
 
-        return result
+    try:
+        # Update campaign status to PROCESSING
+        logger.info("Setting campaign status to PROCESSING...")
+        db.execute(
+            text(
+                "UPDATE campaigns SET status = 'PROCESSING', updated_at = :t WHERE id = :id"
+            ),
+            {"id": campaign_id, "t": datetime.utcnow()},
+        )
+        db.commit()
 
-    def update_submission_status(
-        self, db, submission_id: str, success: bool, result: Dict[str, Any]
-    ):
-        """Update submission status in database"""
-        try:
-            status = "success" if success else "failed"
-
-            # Build error message from result
-            error_message = None
-            if not success:
-                if result.get("has_captcha"):
-                    error_message = "CAPTCHA detected"
-                elif not result.get("form_found"):
-                    error_message = "No contact form found"
-                elif not result.get("form_filled"):
-                    error_message = "Could not fill form fields"
-                elif not result.get("form_submitted"):
-                    error_message = "Form submission failed"
-                else:
-                    error_message = result.get("error", "Unknown error")
-
-            update_query = text(
-                """
-                UPDATE submissions 
-                SET status = :status,
-                    error_message = :error_message,
-                    form_found = :form_found,
-                    has_captcha = :has_captcha,
-                    processed_at = :processed_at,
-                    updated_at = :updated_at
-                WHERE id = :id
-            """
-            )
-
+        # Get campaign
+        campaign = (
             db.execute(
-                update_query,
-                {
-                    "id": submission_id,
-                    "status": status,
-                    "error_message": error_message,
-                    "form_found": result.get("form_found", False),
-                    "has_captcha": result.get("has_captcha", False),
-                    "processed_at": datetime.utcnow(),
-                    "updated_at": datetime.utcnow(),
-                },
+                text(
+                    "SELECT id, name, message, total_urls FROM campaigns WHERE id = :id AND user_id = :uid"
+                ),
+                {"id": campaign_id, "uid": user_id},
             )
+            .mappings()
+            .first()
+        )
 
-        except Exception as e:
-            logger.error(f"Failed to update submission {submission_id}: {e}")
+        if not campaign:
+            logger.error(f"Campaign not found: {campaign_id}")
+            return
 
-    def update_campaign_progress(self, db):
-        """Update campaign progress"""
-        try:
-            update_query = text(
-                """
-                UPDATE campaigns 
-                SET processed = :processed,
-                    successful = :successful,
-                    failed = :failed,
-                    updated_at = :updated_at
-                WHERE id = :campaign_id
-            """
-            )
+        logger.info(
+            f"Campaign: {campaign['name']} | Total URLs: {campaign['total_urls']}"
+        )
 
+        # Get user profile for form filling
+        logger.info("Fetching user profile...")
+        user_profile = get_user_profile(db, user_id)
+        logger.info(
+            f"User profile loaded: {user_profile['first_name']} {user_profile['last_name']}"
+        )
+
+        # Get pending submissions
+        submissions = (
             db.execute(
-                update_query,
-                {
-                    "campaign_id": self.campaign_id,
-                    "processed": self.processed_count,
-                    "successful": self.success_count,
-                    "failed": self.failed_count,
-                    "updated_at": datetime.utcnow(),
-                },
+                text(
+                    "SELECT id, url FROM submissions WHERE campaign_id = :cid AND status = 'pending'"
+                ),
+                {"cid": campaign_id},
             )
+            .mappings()
+            .all()
+        )
 
-            db.commit()
+        total = len(submissions)
+        logger.info(f"Found {total} submissions to process")
 
-        except Exception as e:
-            logger.error(f"Failed to update campaign progress: {e}")
-            db.rollback()
+        if total == 0:
+            logger.info("No submissions - marking campaign COMPLETED")
+            update_campaign(db, campaign_id, "COMPLETED", 0, 0, 0)
+            return
 
-    def get_campaign_message(self, db) -> str:
-        """Get campaign message template"""
+        # Process with enhanced browser automation
+        logger.info("Starting browser automation...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         try:
-            query = text("SELECT message FROM campaigns WHERE id = :campaign_id")
-            result = db.execute(query, {"campaign_id": self.campaign_id}).first()
-
-            if result and result[0]:
-                return result[0]
-
-            return "Hello, I'm interested in learning more about your services."
-
-        except Exception as e:
-            logger.error(f"Failed to get campaign message: {e}")
-            return "Hello, I'm interested in your services."
-
-    def get_pending_submissions(self, db, batch_size: int = 10) -> List[Dict[str, Any]]:
-        """Get batch of pending submissions"""
-        try:
-            query = text(
-                """
-                SELECT id, url, campaign_id, user_id
-                FROM submissions 
-                WHERE campaign_id = :campaign_id 
-                AND status = 'pending'
-                ORDER BY created_at
-                LIMIT :limit
-            """
-            )
-
-            result = db.execute(
-                query, {"campaign_id": self.campaign_id, "limit": batch_size}
-            ).fetchall()
-
-            submissions = []
-            for row in result:
-                submissions.append(
-                    {
-                        "id": str(row[0]),
-                        "url": row[1],
-                        "campaign_id": str(row[2]),
-                        "user_id": str(row[3]) if row[3] else None,
-                    }
+            successful, failed = loop.run_until_complete(
+                process_with_playwright(
+                    db, submissions, campaign_id, user_profile, user_id
                 )
-
-            return submissions
-
-        except Exception as e:
-            logger.error(f"Failed to get pending submissions: {e}")
-            return []
-
-    def check_campaign_status(self, db) -> str:
-        """Check if campaign should continue"""
-        try:
-            query = text("SELECT status FROM campaigns WHERE id = :campaign_id")
-            result = db.execute(query, {"campaign_id": self.campaign_id}).first()
-
-            if result:
-                return result[0]
-            return "UNKNOWN"
-
-        except Exception as e:
-            logger.error(f"Failed to check campaign status: {e}")
-            return "ERROR"
-
-    def mark_campaign_complete(self, db):
-        """Mark campaign as completed"""
-        try:
-            update_query = text(
-                """
-                UPDATE campaigns 
-                SET status = 'COMPLETED',
-                    completed_at = :completed_at,
-                    updated_at = :updated_at
-                WHERE id = :campaign_id
-            """
             )
-
-            now = datetime.utcnow()
-            db.execute(
-                update_query,
-                {
-                    "campaign_id": self.campaign_id,
-                    "completed_at": now,
-                    "updated_at": now,
-                },
-            )
-
-            db.commit()
-            logger.info(f"Campaign {self.campaign_id} marked as completed")
-
-        except Exception as e:
-            logger.error(f"Failed to mark campaign as complete: {e}")
-            db.rollback()
-
-    def mark_campaign_failed(self, db, error_message: str):
-        """Mark campaign as failed"""
-        try:
-            update_query = text(
-                """
-                UPDATE campaigns 
-                SET status = 'FAILED',
-                    error_message = :error_message,
-                    updated_at = :updated_at
-                WHERE id = :campaign_id
-            """
-            )
-
-            db.execute(
-                update_query,
-                {
-                    "campaign_id": self.campaign_id,
-                    "error_message": error_message[:500],
-                    "updated_at": datetime.utcnow(),
-                },
-            )
-
-            db.commit()
-            logger.error(
-                f"Campaign {self.campaign_id} marked as failed: {error_message}"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to mark campaign as failed: {e}")
-            db.rollback()
-
-    async def run(self):
-        """Main async processing loop"""
-        logger.info(f"Starting campaign processor for {self.campaign_id}")
-        db = self.get_db()
-
-        try:
-            # Initialize browser
-            await self.form_submitter.initialize()
-
-            # Get campaign message
-            message = self.get_campaign_message(db)
-
-            while self.is_running:
-                # Check campaign status
-                status = self.check_campaign_status(db)
-
-                if status not in ["PROCESSING", "RUNNING"]:
-                    logger.info(
-                        f"Campaign {self.campaign_id} status is {status}, stopping"
-                    )
-                    break
-
-                # Get pending submissions
-                submissions = self.get_pending_submissions(db, batch_size=5)
-
-                if not submissions:
-                    logger.info(
-                        f"No more pending submissions for campaign {self.campaign_id}"
-                    )
-                    self.mark_campaign_complete(db)
-                    break
-
-                logger.info(f"Processing batch of {len(submissions)} submissions")
-
-                # Process each submission
-                for submission in submissions:
-                    try:
-                        # Process with browser automation
-                        result = await self.process_submission(submission, message)
-
-                        # Update database
-                        if result["success"]:
-                            self.success_count += 1
-                        else:
-                            self.failed_count += 1
-
-                        self.processed_count += 1
-                        self.update_submission_status(
-                            db, submission["id"], result["success"], result
-                        )
-
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing submission {submission['id']}: {e}"
-                        )
-                        self.failed_count += 1
-                        self.processed_count += 1
-                        self.update_submission_status(
-                            db, submission["id"], False, {"error": str(e)[:200]}
-                        )
-
-                # Commit batch and update progress
-                db.commit()
-                self.update_campaign_progress(db)
-
-                logger.info(
-                    f"Batch complete. Total: {self.processed_count}, Success: {self.success_count}, Failed: {self.failed_count}"
-                )
-
-                # Brief pause between batches
-                await asyncio.sleep(2)
-
-            logger.info(
-                f"Campaign processor finished. Total: {self.processed_count}, Success: {self.success_count}, Failed: {self.failed_count}"
-            )
-
-        except Exception as e:
-            error_msg = f"Campaign processor error: {str(e)}\n{traceback.format_exc()}"
-            logger.error(error_msg)
-            self.mark_campaign_failed(db, str(e))
-
         finally:
-            # Cleanup
-            await self.form_submitter.cleanup()
-            db.close()
+            loop.close()
 
-    def stop(self):
-        """Stop the processor"""
-        logger.info(f"Stopping campaign processor for {self.campaign_id}")
-        self.is_running = False
+        # Final update
+        final_status = "COMPLETED" if successful > 0 else "FAILED"
+        update_campaign(db, campaign_id, final_status, total, successful, failed)
+
+        logger.info("=" * 70)
+        logger.info(f"COMPLETE: {successful}/{total} successful, {failed} failed")
+        logger.info("=" * 70)
+
+    except Exception as e:
+        logger.error(f"FATAL ERROR: {e}", exc_info=True)
+        update_campaign(db, campaign_id, "FAILED", 0, 0, 0, str(e))
+    finally:
+        db.close()
 
 
-def main():
-    """Main entry point"""
-    if len(sys.argv) < 3:
-        print("Usage: python campaign_processor.py <campaign_id> <user_id>")
+async def process_with_playwright(
+    db, submissions, campaign_id: str, user_profile: Dict, user_id: str
+):
+    """Process submissions with Playwright browser automation."""
+    logger.info("Initializing Playwright browser automation...")
+
+    successful = 0
+    failed = 0
+
+    try:
+        # Import Playwright
+        from playwright.async_api import async_playwright
+
+        logger.info("Playwright imported successfully")
+
+        async with async_playwright() as p:
+            # Launch browser with visible mode for debugging
+            browser = await p.chromium.launch(
+                headless=False,  # Set to True for production
+                slow_mo=1000,  # Slow down for visibility
+                args=[
+                    "--no-sandbox",
+                    "--disable-bounding-box-for-test",
+                    "--disable-ipc-flooding-protection",
+                ],
+            )
+            logger.info("Browser launched successfully")
+
+            # Create browser context
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+
+            # Create page
+            page = await context.new_page()
+            logger.info("Browser page created")
+
+            # Process each submission
+            for idx, submission in enumerate(submissions, 1):
+                try:
+                    logger.info(f"\n{'='*50}")
+                    logger.info(
+                        f"[{idx}/{len(submissions)}] Processing: {submission['url']}"
+                    )
+                    logger.info(f"{'='*50}")
+
+                    # Update submission status
+                    update_submission(db, submission["id"], "processing")
+
+                    # Navigate to URL
+                    logger.info(f"Navigating to: {submission['url']}")
+                    await page.goto(
+                        submission["url"],
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await asyncio.sleep(2)
+                    logger.info("Page loaded successfully")
+
+                    # Try to find contact page link
+                    contact_link = None
+                    contact_patterns = [
+                        "contact",
+                        "contact us",
+                        "get in touch",
+                        "reach out",
+                        "contact-us",
+                        "contactus",
+                        "touch",
+                        "connect",
+                    ]
+
+                    for pattern in contact_patterns:
+                        try:
+                            # Try different selectors
+                            selectors = [
+                                f'a:has-text("{pattern}")',
+                                f'a[href*="{pattern}"]',
+                                f'*:has-text("{pattern}") a',
+                            ]
+
+                            for selector in selectors:
+                                links = await page.query_selector_all(selector)
+                                if links:
+                                    # Filter for visible links
+                                    for link in links:
+                                        if await link.is_visible():
+                                            contact_link = link
+                                            logger.info(
+                                                f"Found contact link with pattern: {pattern}"
+                                            )
+                                            break
+                                if contact_link:
+                                    break
+                            if contact_link:
+                                break
+                        except:
+                            continue
+
+                    # Click contact link if found
+                    if contact_link:
+                        logger.info("Clicking contact link...")
+                        try:
+                            await contact_link.click()
+                            await page.wait_for_load_state(
+                                "domcontentloaded", timeout=10000
+                            )
+                            await asyncio.sleep(2)
+                            logger.info("Contact page loaded")
+                        except Exception as e:
+                            logger.warning(f"Failed to click contact link: {e}")
+
+                    # Look for form
+                    forms = await page.query_selector_all("form")
+                    contact_form = None
+
+                    if forms:
+                        logger.info(f"Found {len(forms)} form(s)")
+                        # Try to find the most relevant form
+                        for form in forms:
+                            if await form.is_visible():
+                                # Check if form has email field (good indicator of contact form)
+                                email_field = await form.query_selector(
+                                    'input[type="email"], input[name*="email"]'
+                                )
+                                if email_field:
+                                    contact_form = form
+                                    logger.info("Found contact form with email field")
+                                    break
+
+                        # If no email field found, use first visible form
+                        if not contact_form:
+                            for form in forms:
+                                if await form.is_visible():
+                                    contact_form = form
+                                    logger.info("Using first visible form")
+                                    break
+
+                    if contact_form:
+                        logger.info("Attempting to fill form...")
+                        fields_filled = 0
+
+                        # Define field mappings
+                        field_mappings = [
+                            # Email fields
+                            {
+                                "selectors": [
+                                    'input[type="email"]',
+                                    'input[name*="email" i]',
+                                    'input[id*="email" i]',
+                                    'input[placeholder*="email" i]',
+                                ],
+                                "value": user_profile["email"],
+                                "name": "email",
+                            },
+                            # Name fields
+                            {
+                                "selectors": [
+                                    'input[name*="name" i]',
+                                    'input[id*="name" i]',
+                                    'input[placeholder*="name" i]',
+                                    'input[name*="first" i]',
+                                    'input[id*="first" i]',
+                                ],
+                                "value": f"{user_profile['first_name']} {user_profile['last_name']}".strip(),
+                                "name": "name",
+                            },
+                            # Phone fields
+                            {
+                                "selectors": [
+                                    'input[name*="phone" i]',
+                                    'input[id*="phone" i]',
+                                    'input[placeholder*="phone" i]',
+                                    'input[type="tel"]',
+                                ],
+                                "value": user_profile.get("phone_number", ""),
+                                "name": "phone",
+                            },
+                            # Company fields
+                            {
+                                "selectors": [
+                                    'input[name*="company" i]',
+                                    'input[id*="company" i]',
+                                    'input[placeholder*="company" i]',
+                                ],
+                                "value": user_profile.get("company_name", ""),
+                                "name": "company",
+                            },
+                            # Message/textarea fields
+                            {
+                                "selectors": [
+                                    "textarea",
+                                    'input[name*="message" i]',
+                                    'input[id*="message" i]',
+                                    'textarea[name*="comment" i]',
+                                ],
+                                "value": user_profile["message"],
+                                "name": "message",
+                            },
+                        ]
+
+                        # Fill form fields
+                        for field_group in field_mappings:
+                            if not field_group["value"]:  # Skip empty values
+                                continue
+
+                            for selector in field_group["selectors"]:
+                                try:
+                                    # Look for field within the form
+                                    element = await contact_form.query_selector(
+                                        selector
+                                    )
+                                    if (
+                                        element
+                                        and await element.is_visible()
+                                        and await element.is_enabled()
+                                    ):
+                                        await element.fill(field_group["value"])
+                                        fields_filled += 1
+                                        logger.info(
+                                            f"  ✓ Filled {field_group['name']}: {field_group['value'][:30]}..."
+                                        )
+                                        break  # Move to next field group
+                                except Exception as e:
+                                    logger.debug(f"Failed to fill {selector}: {e}")
+                                    continue
+
+                        logger.info(f"Filled {fields_filled} form fields")
+
+                        if fields_filled > 0:
+                            # Try to submit form
+                            submit_selectors = [
+                                'button[type="submit"]',
+                                'input[type="submit"]',
+                                'button:has-text("submit")',
+                                'button:has-text("send")',
+                                'button:has-text("contact")',
+                                '[role="button"]:has-text("submit")',
+                            ]
+
+                            submitted = False
+                            for selector in submit_selectors:
+                                try:
+                                    submit_btn = await contact_form.query_selector(
+                                        selector
+                                    )
+                                    if (
+                                        submit_btn
+                                        and await submit_btn.is_visible()
+                                        and await submit_btn.is_enabled()
+                                    ):
+                                        logger.info(
+                                            f"Clicking submit button: {selector}"
+                                        )
+                                        await submit_btn.click()
+                                        await asyncio.sleep(3)  # Wait for submission
+                                        submitted = True
+                                        break
+                                except Exception as e:
+                                    logger.debug(f"Failed to click {selector}: {e}")
+                                    continue
+
+                            if submitted:
+                                # Check for success indicators
+                                success_indicators = [
+                                    "thank you",
+                                    "thanks",
+                                    "success",
+                                    "sent",
+                                    "submitted",
+                                    "received",
+                                    "message sent",
+                                ]
+
+                                page_content = await page.content()
+                                success_found = any(
+                                    indicator in page_content.lower()
+                                    for indicator in success_indicators
+                                )
+
+                                if success_found:
+                                    successful += 1
+                                    update_submission(
+                                        db,
+                                        submission["id"],
+                                        "successful",
+                                        details=f"Form submitted with {fields_filled} fields",
+                                    )
+                                    logger.info(
+                                        "  ✓ Form submitted successfully with success indicator"
+                                    )
+                                else:
+                                    successful += 1  # Assume success if no error
+                                    update_submission(
+                                        db,
+                                        submission["id"],
+                                        "successful",
+                                        details=f"Form submitted with {fields_filled} fields",
+                                    )
+                                    logger.info(
+                                        "  ✓ Form submitted (no error detected)"
+                                    )
+                            else:
+                                failed += 1
+                                update_submission(
+                                    db,
+                                    submission["id"],
+                                    "failed",
+                                    "No submit button found",
+                                )
+                                logger.warning("  ✗ No submit button found")
+                        else:
+                            failed += 1
+                            update_submission(
+                                db,
+                                submission["id"],
+                                "failed",
+                                "No form fields could be filled",
+                            )
+                            logger.warning("  ✗ No form fields could be filled")
+
+                    else:
+                        # Try email extraction as fallback
+                        logger.info("No form found, trying email extraction...")
+                        emails = await page.query_selector_all('a[href^="mailto:"]')
+
+                        if emails:
+                            email_href = await emails[0].get_attribute("href")
+                            email = email_href.replace("mailto:", "").split("?")[0]
+                            successful += 1
+                            update_submission(
+                                db,
+                                submission["id"],
+                                "successful",
+                                details=f"Email extracted: {email}",
+                            )
+                            logger.info(f"  ✓ Email found: {email}")
+                        else:
+                            # Look for email patterns in text
+                            page_text = await page.text_content("body")
+                            import re
+
+                            email_pattern = (
+                                r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+                            )
+                            emails_found = re.findall(email_pattern, page_text)
+
+                            if emails_found:
+                                email = emails_found[0]
+                                successful += 1
+                                update_submission(
+                                    db,
+                                    submission["id"],
+                                    "successful",
+                                    details=f"Email found in text: {email}",
+                                )
+                                logger.info(f"  ✓ Email found in text: {email}")
+                            else:
+                                failed += 1
+                                update_submission(
+                                    db,
+                                    submission["id"],
+                                    "failed",
+                                    "No form or email found",
+                                )
+                                logger.warning("  ✗ No form or email found")
+
+                    # Add delay between submissions
+                    if idx < len(submissions):
+                        logger.info("  Waiting 5 seconds before next submission...")
+                        await asyncio.sleep(5)
+
+                except Exception as e:
+                    logger.error(f"  Error processing submission: {e}", exc_info=True)
+                    failed += 1
+                    update_submission(db, submission["id"], "failed", str(e))
+
+            # Close browser
+            await browser.close()
+            logger.info("Browser closed")
+
+    except ImportError as e:
+        logger.error(f"Failed to import Playwright: {e}")
+        logger.error(
+            "Please install Playwright: pip install playwright && playwright install"
+        )
+        failed = len(submissions)
+
+        # Mark all submissions as failed
+        for submission in submissions:
+            update_submission(
+                db, submission["id"], "failed", f"Playwright not available: {e}"
+            )
+
+    except Exception as e:
+        logger.error(f"Browser automation error: {e}", exc_info=True)
+        failed = len(submissions)
+
+        # Mark all submissions as failed
+        for submission in submissions:
+            update_submission(db, submission["id"], "failed", str(e))
+
+    return successful, failed
+
+
+def update_submission(
+    db, submission_id: str, status: str, error: str = None, details: str = None
+):
+    """Update submission status."""
+    try:
+        if error:
+            db.execute(
+                text(
+                    "UPDATE submissions SET status = :s, error_message = :e, updated_at = :t WHERE id = :id"
+                ),
+                {"s": status, "e": error, "t": datetime.utcnow(), "id": submission_id},
+            )
+        else:
+            db.execute(
+                text(
+                    "UPDATE submissions SET status = :s, updated_at = :t WHERE id = :id"
+                ),
+                {"s": status, "t": datetime.utcnow(), "id": submission_id},
+            )
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to update submission: {e}")
+        db.rollback()
+
+
+def update_campaign(
+    db,
+    campaign_id: str,
+    status: str,
+    total: int,
+    successful: int,
+    failed: int,
+    error: str = None,
+):
+    """Update campaign status."""
+    try:
+        db.execute(
+            text(
+                """UPDATE campaigns SET status = :s, processed = :p, successful = :su, 
+                    failed = :f, error_message = :e, updated_at = :t WHERE id = :id"""
+            ),
+            {
+                "s": status,
+                "p": total,
+                "su": successful,
+                "f": failed,
+                "e": error,
+                "t": datetime.utcnow(),
+                "id": campaign_id,
+            },
+        )
+        db.commit()
+        logger.info(
+            f"Campaign updated: status={status}, processed={total}, successful={successful}, failed={failed}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to update campaign: {e}")
+        db.rollback()
+
+
+# MAIN ENTRY POINT - This is what was missing!
+if __name__ == "__main__":
+    """Entry point when script is run directly from command line."""
+
+    # Check command line arguments
+    if len(sys.argv) != 3:
+        logger.error("Usage: python campaign_processor.py <campaign_id> <user_id>")
         sys.exit(1)
 
     campaign_id = sys.argv[1]
     user_id = sys.argv[2]
 
-    logger.info(f"Campaign processor started for campaign {campaign_id}")
+    logger.info(f"Starting campaign processor from command line")
+    logger.info(f"Campaign ID: {campaign_id}")
+    logger.info(f"User ID: {user_id}")
 
     try:
-        processor = CampaignProcessor(campaign_id, user_id)
-
-        # Run async processor
-        asyncio.run(processor.run())
-
+        # Run the main processing function
+        process_campaign_submissions(campaign_id, user_id)
+        logger.info("Campaign processing completed successfully")
     except Exception as e:
-        logger.error(f"Fatal error: {e}\n{traceback.format_exc()}")
+        logger.error(f"Campaign processing failed: {e}", exc_info=True)
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

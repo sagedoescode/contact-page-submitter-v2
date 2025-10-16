@@ -313,15 +313,15 @@ def test_api_simple():
     print("   uvicorn app.main:app --reload\n")
 
     print("2. Test health endpoint:")
-    print("   curl http://localhost:8001/api/health/health\n")
+    print("   curl http://localhost:8000/api/health/health\n")
 
     print("3. Test login:")
-    print("   curl -X POST http://localhost:8001/api/auth/login \\")
+    print("   curl -X POST http://localhost:8000/api/auth/login \\")
     print('     -H "Content-Type: application/json" \\')
     print('     -d \'{"email":"admin@example.com","password":"Admin123456!"}\'')
 
     print("\nOr using PowerShell:")
-    print('   Invoke-RestMethod -Uri "http://localhost:8001/api/auth/login" `')
+    print('   Invoke-RestMethod -Uri "http://localhost:8000/api/auth/login" `')
     print('     -Method Post -ContentType "application/json" `')
     print('     -Body \'{"email":"admin@example.com","password":"Admin123456!"}\'')
 

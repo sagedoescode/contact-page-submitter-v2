@@ -1,4 +1,4 @@
-"""Enhanced Logs API endpoints with comprehensive logging."""
+"""Enhanced Logs API endpoints with optimized logging."""
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Response
 from fastapi.responses import StreamingResponse
@@ -13,105 +13,62 @@ import gzip
 import csv
 import re
 from io import StringIO
-from functools import wraps
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.services.log_service import LogService as ApplicationInsightsLogger
-from app.logging import get_logger, log_function, log_exceptions
+from app.logging import get_logger, log_function
 from app.logging.core import request_id_var, user_id_var, campaign_id_var
 
 # Initialize structured logger
 logger = get_logger(__name__)
 
-# Create FastAPI router (converted from Flask Blueprint)
+# Create FastAPI router
 router = APIRouter(prefix="/api/logs", tags=["logs"], redirect_slashes=False)
 
 # Simulated log storage (in production, use proper log management system)
 LOG_BUFFER = []
 MAX_LOG_BUFFER = 10000
 
-
-def log_operation(func):
-    """Decorator for logging operations on logs."""
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        operation = func.__name__.replace("_", " ").title()
-        start_time = time.time()
-
-        # Extract request from function arguments
-        request = None
-        current_user = None
-        for arg in args:
-            if isinstance(arg, Request):
-                request = arg
-        for key, value in kwargs.items():
-            if key == "current_user" and isinstance(value, User):
-                current_user = value
-
-        context = {
-            "operation": operation,
-            "endpoint": request.url.path if request else "unknown",
-            "method": request.method if request else "unknown",
-            "ip": request.client.host if request and request.client else "unknown",
-            "user_id": str(current_user.id) if current_user else None,
-        }
-
-        logger.info(f"Starting log operation: {operation}", context=context)
-
-        try:
-            result = func(*args, **kwargs)
-            duration = time.time() - start_time
-
-            logger.info(
-                f"Log operation completed: {operation}",
-                context={
-                    **context,
-                    "duration": duration,
-                    "status": "success",
-                },
-            )
-
-            # Log performance for slow operations
-            if duration > 2.0:
-                logger.warning(
-                    f"Slow operation detected: {operation}",
-                    context={
-                        **context,
-                        "duration": duration,
-                    },
-                )
-
-            return result
-
-        except Exception as e:
-            duration = time.time() - start_time
-            logger.error(
-                f"Log operation failed: {operation}",
-                context={
-                    **context,
-                    "duration": duration,
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                },
-            )
-            raise
-
-    return wrapper
+# Cache for frequent queries
+STATS_CACHE = {"last_update": None, "data": None, "ttl": 60}  # seconds
 
 
-def validate_log_access(user_id: str, log_level: str = None) -> bool:
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    if not request:
+        return "unknown"
+
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
+
+    return request.client.host if request.client else "unknown"
+
+
+def validate_log_access(user: User, log_level: str = None) -> bool:
     """Validate if user has access to view logs."""
     # Implement your access control logic here
-    # For now, returning True for demonstration
-    if log_level in ["ERROR", "CRITICAL", "SECURITY"]:
-        logger.info(
-            "Validating sensitive log access",
-            context={"user_id": user_id, "log_level": log_level},
+    # For now, basic validation
+    user_id = str(user.id)
+
+    # Only log sensitive access attempts
+    if log_level in ["CRITICAL", "SECURITY"]:
+        logger.security_event(
+            event="sensitive_log_access",
+            severity="info",
+            properties={
+                "user_id": user_id,
+                "log_level": log_level,
+            },
         )
-    return True
+
+    return True  # Implement actual permission check
 
 
 def parse_log_query(query_params: dict) -> Dict[str, Any]:
@@ -133,26 +90,20 @@ def parse_log_query(query_params: dict) -> Dict[str, Any]:
         try:
             parsed["start_time"] = datetime.fromisoformat(query_params["start_time"])
         except ValueError:
-            logger.warning(
-                "Invalid start_time format",
-                context={"start_time": query_params["start_time"]},
-            )
+            pass  # Invalid format, use None
 
     if query_params.get("end_time"):
         try:
             parsed["end_time"] = datetime.fromisoformat(query_params["end_time"])
         except ValueError:
-            logger.warning(
-                "Invalid end_time format",
-                context={"end_time": query_params["end_time"]},
-            )
+            pass  # Invalid format, use None
 
     return parsed
 
 
 @router.get("/query")
-@log_operation
-def query_logs(
+@log_function("query_logs")
+async def query_logs(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -167,8 +118,9 @@ def query_logs(
     format: str = Query("json"),
 ):
     """Query and retrieve logs based on filters."""
+    user_id_var.set(str(current_user.id))
+
     try:
-        user_id_val = str(current_user.id)
         query_params = parse_log_query(
             {
                 "level": level,
@@ -184,34 +136,19 @@ def query_logs(
         )
 
         # Check access
-        if not validate_log_access(user_id_val, query_params["level"]):
-            logger.warning(
-                "Unauthorized log access attempt",
-                context={
-                    "user_id": user_id_val,
+        if not validate_log_access(current_user, query_params["level"]):
+            # Log unauthorized attempt
+            logger.security_event(
+                event="unauthorized_log_access",
+                severity="warning",
+                properties={
+                    "user_id": str(current_user.id),
                     "requested_level": query_params["level"],
+                    "ip": get_client_ip(request),
                 },
             )
 
-            # Log security event
-            app_logger = ApplicationInsightsLogger(db)
-            app_logger.track_security_event(
-                event_name="unauthorized_log_access",
-                user_id=user_id_val,
-                ip_address=request.client.host if request.client else "unknown",
-                success=False,
-                details={"requested_level": query_params["level"]},
-            )
-
             raise HTTPException(status_code=403, detail="Unauthorized access to logs")
-
-        logger.info(
-            "Processing log query",
-            context={"user_id": user_id_val, "query_params": query_params},
-        )
-
-        # Simulate log retrieval (replace with actual log system query)
-        logs = []
 
         # Filter logs based on criteria
         filtered_logs = LOG_BUFFER.copy()
@@ -250,14 +187,7 @@ def query_logs(
         end_idx = start_idx + query_params["limit"]
         paginated_logs = filtered_logs[start_idx:end_idx]
 
-        logger.info(
-            "Log query completed",
-            context={
-                "user_id": user_id_val,
-                "total_results": total_count,
-                "returned_results": len(paginated_logs),
-            },
-        )
+        # No logging for successful queries - too frequent
 
         return {
             "success": True,
@@ -272,38 +202,40 @@ def query_logs(
     except Exception as e:
         logger.error(
             "Failed to query logs",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to retrieve logs")
 
 
 @router.get("/stream")
-@log_operation
-def stream_logs(
+async def stream_logs(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     level: str = Query("INFO"),
 ):
     """Stream real-time logs."""
+    user_id_var.set(str(current_user.id))
+
     try:
-        user_id_val = str(current_user.id)
         level = level.upper()
 
-        if not validate_log_access(user_id_val, level):
-            logger.warning(
-                "Unauthorized log streaming attempt",
-                context={"user_id": user_id_val, "requested_level": level},
-            )
+        if not validate_log_access(current_user, level):
             raise HTTPException(status_code=403, detail="Unauthorized")
 
-        logger.info(
-            "Starting log stream", context={"user_id": user_id_val, "level": level}
-        )
+        # Only log stream start for debugging/monitoring
+        if level in ["ERROR", "CRITICAL"]:
+            logger.info(
+                "Error log stream started",
+                extra={
+                    "user_id": str(current_user.id),
+                    "level": level,
+                },
+            )
 
         def generate():
             """Generate log stream."""
@@ -332,39 +264,30 @@ def stream_logs(
     except Exception as e:
         logger.error(
             "Failed to stream logs",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to stream logs")
 
 
 @router.post("/export")
-@log_operation
-def export_logs(
+@log_function("export_logs")
+async def export_logs(
     request: Request,
     export_data: dict,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Export logs in various formats."""
-    try:
-        user_id_val = str(current_user.id)
+    user_id_var.set(str(current_user.id))
 
+    try:
         export_format = export_data.get("format", "json")
         compress = export_data.get("compress", False)
         filters = export_data.get("filters", {})
-
-        logger.info(
-            "Processing log export request",
-            context={
-                "user_id": user_id_val,
-                "format": export_format,
-                "compress": compress,
-            },
-        )
 
         # Query logs with filters
         query_params = parse_log_query(filters)
@@ -383,10 +306,6 @@ def export_logs(
             output = convert_logs_to_text(exported_logs)
             content_type = "text/plain"
         else:
-            logger.warning(
-                "Invalid export format requested",
-                context={"user_id": user_id_val, "format": export_format},
-            )
             raise HTTPException(status_code=400, detail="Invalid export format")
 
         # Compress if requested
@@ -394,13 +313,15 @@ def export_logs(
             output = gzip.compress(output.encode())
             content_type = "application/gzip"
 
+        # Log export for audit trail
         logger.info(
-            "Log export completed",
-            context={
-                "user_id": user_id_val,
+            "Logs exported",
+            extra={
+                "user_id": str(current_user.id),
                 "format": export_format,
-                "size_bytes": len(output),
                 "log_count": len(exported_logs),
+                "compressed": compress,
+                "ip": get_client_ip(request),
             },
         )
 
@@ -418,49 +339,49 @@ def export_logs(
     except Exception as e:
         logger.error(
             "Failed to export logs",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to export logs")
 
 
 @router.get("/stats")
-@log_operation
-def get_log_stats(
+async def get_log_stats(
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     range: str = Query("24h"),
 ):
-    """Get log statistics and analytics."""
-    try:
-        user_id_val = str(current_user.id)
-        time_range = range
+    """Get log statistics and analytics - cached for performance."""
+    user_id_var.set(str(current_user.id))
 
-        logger.info(
-            "Generating log statistics",
-            context={"user_id": user_id_val, "time_range": time_range},
-        )
+    try:
+        # Check cache first
+        if STATS_CACHE["last_update"]:
+            cache_age = time.time() - STATS_CACHE["last_update"]
+            if cache_age < STATS_CACHE["ttl"] and STATS_CACHE["data"]:
+                # Return cached stats without logging
+                return {"success": True, "stats": STATS_CACHE["data"]}
 
         # Calculate time window
-        if time_range == "1h":
+        if range == "1h":
             start_time = datetime.utcnow() - timedelta(hours=1)
-        elif time_range == "24h":
+        elif range == "24h":
             start_time = datetime.utcnow() - timedelta(days=1)
-        elif time_range == "7d":
+        elif range == "7d":
             start_time = datetime.utcnow() - timedelta(days=7)
-        elif time_range == "30d":
+        elif range == "30d":
             start_time = datetime.utcnow() - timedelta(days=30)
         else:
             start_time = datetime.utcnow() - timedelta(days=1)
 
-        # Generate statistics (simplified for demo)
+        # Generate statistics
         stats = {
             "total_logs": len(LOG_BUFFER),
-            "time_range": time_range,
+            "time_range": range,
             "start_time": start_time.isoformat(),
             "end_time": datetime.utcnow().isoformat(),
             "by_level": {
@@ -473,7 +394,6 @@ def get_log_stats(
             "by_source": {},
             "error_rate": 0,
             "top_errors": [],
-            "activity_timeline": [],
         }
 
         # Count logs by level
@@ -489,60 +409,56 @@ def get_log_stats(
         total_logs = len(LOG_BUFFER)
         error_logs = stats["by_level"]["ERROR"] + stats["by_level"]["CRITICAL"]
         if total_logs > 0:
-            stats["error_rate"] = (error_logs / total_logs) * 100
+            stats["error_rate"] = round((error_logs / total_logs) * 100, 2)
 
-        logger.info(
-            "Log statistics generated",
-            context={
-                "user_id": user_id_val,
-                "total_logs": stats["total_logs"],
-                "error_rate": stats["error_rate"],
-            },
-        )
+        # Update cache
+        STATS_CACHE["last_update"] = time.time()
+        STATS_CACHE["data"] = stats
+
+        # Only log if high error rate detected
+        if stats["error_rate"] > 10:
+            logger.warning(
+                "High error rate detected in logs",
+                extra={
+                    "error_rate": stats["error_rate"],
+                    "error_count": error_logs,
+                    "total_logs": total_logs,
+                },
+            )
 
         return {"success": True, "stats": stats}
 
     except Exception as e:
         logger.error(
             "Failed to generate log statistics",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to generate statistics")
 
 
 @router.delete("/purge")
-@log_operation
-def purge_logs(
+@log_function("purge_logs")
+async def purge_logs(
     request: Request,
     purge_data: dict,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Purge old logs (admin only)."""
-    try:
-        user_id_val = str(current_user.id)
+    user_id_var.set(str(current_user.id))
 
-        # Check admin permission (implement your own logic)
-        # if not is_admin(user_id_val):
+    try:
+        # TODO: Check admin permission
+        # if not is_admin(current_user):
         #     raise HTTPException(status_code=403, detail='Unauthorized')
 
         older_than_days = purge_data.get("older_than_days", 30)
         level = purge_data.get("level")
         dry_run = purge_data.get("dry_run", True)
-
-        logger.warning(
-            "Log purge requested",
-            context={
-                "user_id": user_id_val,
-                "older_than_days": older_than_days,
-                "level": level,
-                "dry_run": dry_run,
-            },
-        )
 
         # Calculate cutoff time
         cutoff_time = datetime.utcnow() - timedelta(days=older_than_days)
@@ -571,17 +487,24 @@ def purge_logs(
             ]
             actual_purged = original_count - len(LOG_BUFFER)
 
+            # Log purge action for audit trail
             logger.warning(
-                "Logs purged successfully",
-                context={"user_id": user_id_val, "logs_purged": actual_purged},
+                "Logs purged",
+                extra={
+                    "user_id": str(current_user.id),
+                    "logs_purged": actual_purged,
+                    "older_than_days": older_than_days,
+                    "level": level,
+                    "ip": get_client_ip(request),
+                },
             )
 
-            # Log security event
+            # Track security event
             app_logger = ApplicationInsightsLogger(db)
             app_logger.track_security_event(
                 event_name="logs_purged",
-                user_id=user_id_val,
-                ip_address=request.client.host if request.client else "unknown",
+                user_id=str(current_user.id),
+                ip_address=get_client_ip(request),
                 success=True,
                 details={
                     "logs_purged": actual_purged,
@@ -601,13 +524,44 @@ def purge_logs(
     except Exception as e:
         logger.error(
             "Failed to purge logs",
-            context={
+            extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": str(current_user.id),
             },
+            exc_info=True,
         )
         raise HTTPException(status_code=500, detail="Failed to purge logs")
+
+
+@router.get("/recent")
+async def get_recent_logs(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    limit: int = Query(20, le=100),
+):
+    """Get recent logs quickly without filters."""
+    user_id_var.set(str(current_user.id))
+
+    try:
+        # Simple recent logs - no filtering, no logging
+        recent_logs = LOG_BUFFER[-limit:] if len(LOG_BUFFER) > limit else LOG_BUFFER
+
+        return {
+            "success": True,
+            "logs": list(reversed(recent_logs)),  # Most recent first
+            "count": len(recent_logs),
+        }
+
+    except Exception as e:
+        logger.error(
+            "Failed to get recent logs",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to get recent logs")
 
 
 def convert_logs_to_csv(logs: List[Dict]) -> str:
@@ -632,7 +586,6 @@ def convert_logs_to_text(logs: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-# Add sample log entry to buffer for demo
 def add_log_entry(level: str, message: str, **kwargs):
     """Add a log entry to the buffer."""
     entry = {

@@ -1,15 +1,19 @@
-# app/api/dashboard.py - Dashboard overview endpoints
+# app/api/dashboard.py - Dashboard overview endpoints with optimized logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+import time
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
+from app.logging import get_logger, log_function
+from app.logging.core import request_id_var, user_id_var
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
@@ -20,17 +24,37 @@ class DashboardStats(BaseModel):
     performance_metrics: Dict[str, Any]
 
 
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    if not request:
+        return "unknown"
+
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
+
+    return request.client.host if request.client else "unknown"
+
+
 @router.get("/overview", response_model=DashboardStats)
+@log_function("get_dashboard_overview")
 def get_dashboard_overview(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get dashboard overview with key metrics"""
-    try:
-        user_id = str(current_user.id)
+    """Get dashboard overview with key metrics - optimized queries"""
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
-        # Campaign statistics
+    try:
+        start_time = time.perf_counter()
+
+        # Campaign statistics - single optimized query
         campaigns_query = text(
             """
             SELECT 
@@ -49,7 +73,7 @@ def get_dashboard_overview(
         )
         campaigns_stats = dict(campaigns_result) if campaigns_result else {}
 
-        # Submission statistics
+        # Submission statistics - single optimized query
         submissions_query = text(
             """
             SELECT 
@@ -76,30 +100,38 @@ def get_dashboard_overview(
         successful_subs = submissions_stats.get("successful_submissions", 0)
         success_rate = (successful_subs / total_subs * 100) if total_subs > 0 else 0
 
-        # Recent activity
+        # Recent activity - limited to 10 items
         recent_activity_query = text(
             """
-            SELECT 
-                'campaign' as type,
-                c.name as title,
-                c.status as status,
-                c.created_at as timestamp,
-                c.id as entity_id
-            FROM campaigns c
-            WHERE c.user_id = :user_id
+            SELECT * FROM (
+                SELECT 
+                    'campaign' as type,
+                    c.name as title,
+                    c.status as status,
+                    c.created_at as timestamp,
+                    c.id as entity_id
+                FROM campaigns c
+                WHERE c.user_id = :user_id
+                ORDER BY c.created_at DESC
+                LIMIT 5
+            ) campaigns
             
             UNION ALL
             
-            SELECT 
-                'submission' as type,
-                CONCAT('Submission to ', w.domain) as title,
-                s.status as status,
-                s.created_at as timestamp,
-                s.id as entity_id
-            FROM submissions s
-            JOIN campaigns c ON s.campaign_id = c.id
-            LEFT JOIN websites w ON s.website_id = w.id
-            WHERE c.user_id = :user_id
+            SELECT * FROM (
+                SELECT 
+                    'submission' as type,
+                    CONCAT('Submission to ', COALESCE(w.domain, 'unknown')) as title,
+                    s.status as status,
+                    s.created_at as timestamp,
+                    s.id as entity_id
+                FROM submissions s
+                JOIN campaigns c ON s.campaign_id = c.id
+                LEFT JOIN websites w ON s.website_id = w.id
+                WHERE c.user_id = :user_id
+                ORDER BY s.created_at DESC
+                LIMIT 5
+            ) submissions
             
             ORDER BY timestamp DESC
             LIMIT 10
@@ -113,7 +145,7 @@ def get_dashboard_overview(
         recent_activity = []
         for activity in recent_activity_result:
             activity_dict = dict(activity)
-            if activity_dict["timestamp"]:
+            if activity_dict.get("timestamp"):
                 activity_dict["timestamp"] = activity_dict["timestamp"].isoformat()
             recent_activity.append(activity_dict)
 
@@ -140,6 +172,22 @@ def get_dashboard_overview(
             ),
         }
 
+        query_time = (time.perf_counter() - start_time) * 1000
+
+        # Only log if queries are slow or user has significant data
+        if query_time > 100 or campaigns_stats.get("total_campaigns", 0) > 50:
+            logger.database_operation(
+                operation="DASHBOARD_OVERVIEW",
+                table="multiple",
+                duration_ms=query_time,
+                rows_affected=len(recent_activity),
+                properties={
+                    "total_campaigns": campaigns_stats.get("total_campaigns", 0),
+                    "total_submissions": total_subs,
+                    "success_rate": success_rate,
+                },
+            )
+
         return DashboardStats(
             campaigns=campaigns_stats,
             submissions=submissions_stats,
@@ -148,19 +196,29 @@ def get_dashboard_overview(
         )
 
     except Exception as e:
-        print(f"[DASHBOARD ERROR] {e}")
+        logger.error(
+            "Failed to retrieve dashboard data",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "user_id": user_id,
+            },
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail="Failed to retrieve dashboard data")
 
 
 @router.get("/quick-stats")
+@log_function("get_quick_stats")
 def get_quick_stats(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    """Get quick stats for the top navigation bar"""
-    try:
-        user_id = str(current_user.id)
+    """Get quick stats for the top navigation bar - cached/lightweight"""
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
-        # Quick stats query
+    try:
+        # Quick stats query - optimized with single scan
         stats_query = text(
             """
             SELECT 
@@ -171,6 +229,9 @@ def get_quick_stats(
         )
 
         result = db.execute(stats_query, {"user_id": user_id}).mappings().first()
+
+        # No logging for quick stats - this is called frequently
+        # Only log errors, not successful fetches
 
         return (
             dict(result)
@@ -183,7 +244,17 @@ def get_quick_stats(
         )
 
     except Exception as e:
-        print(f"[QUICK STATS ERROR] {e}")
+        # Only log actual errors, not routine operations
+        logger.error(
+            "Failed to retrieve quick stats",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "user_id": user_id,
+            },
+            exc_info=True,
+        )
+        # Return default values on error - don't break the UI
         return {
             "active_campaigns": 0,
             "pending_submissions": 0,
@@ -192,19 +263,26 @@ def get_quick_stats(
 
 
 @router.get("/recent-campaigns")
+@log_function("get_recent_campaigns")
 def get_recent_campaigns(
     limit: int = 5,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get recent campaigns for quick access"""
-    try:
-        user_id = str(current_user.id)
+    """Get recent campaigns for quick access - lightweight query"""
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
 
+    try:
         campaigns_query = text(
             """
             SELECT 
                 id, name, status, total_urls, successful, failed,
+                CASE 
+                    WHEN total_urls > 0 
+                    THEN ROUND((successful * 100.0 / total_urls), 1)
+                    ELSE 0 
+                END as success_rate,
                 created_at, updated_at
             FROM campaigns 
             WHERE user_id = :user_id
@@ -228,8 +306,115 @@ def get_recent_campaigns(
                     campaign_dict[field] = campaign_dict[field].isoformat()
             campaigns.append(campaign_dict)
 
-        return {"campaigns": campaigns}
+        # No logging for successful routine operations
+        # The @log_function decorator handles timing/errors
+
+        return {"campaigns": campaigns, "count": len(campaigns)}
 
     except Exception as e:
-        print(f"[RECENT CAMPAIGNS ERROR] {e}")
-        return {"campaigns": []}
+        logger.error(
+            "Failed to retrieve recent campaigns",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "user_id": user_id,
+                "limit": limit,
+            },
+            exc_info=True,
+        )
+        return {"campaigns": [], "count": 0}
+
+
+@router.get("/performance-trends")
+@log_function("get_performance_trends")
+def get_performance_trends(
+    days: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get performance trends over time - for charts/graphs"""
+    user_id = str(current_user.id)
+    user_id_var.set(user_id)
+
+    if days > 30:
+        days = 30  # Limit to prevent expensive queries
+
+    try:
+        trends_query = text(
+            """
+            WITH daily_stats AS (
+                SELECT 
+                    DATE(s.created_at) as date,
+                    COUNT(s.id) as submissions,
+                    COUNT(CASE WHEN s.success = true THEN 1 END) as successful,
+                    COUNT(CASE WHEN s.success = false THEN 1 END) as failed
+                FROM submissions s
+                JOIN campaigns c ON s.campaign_id = c.id
+                WHERE c.user_id = :user_id
+                    AND s.created_at >= CURRENT_DATE - INTERVAL :days DAY
+                GROUP BY DATE(s.created_at)
+                ORDER BY date DESC
+            )
+            SELECT 
+                date,
+                submissions,
+                successful,
+                failed,
+                CASE 
+                    WHEN submissions > 0 
+                    THEN ROUND((successful * 100.0 / submissions), 1)
+                    ELSE 0 
+                END as success_rate
+            FROM daily_stats
+        """
+        )
+
+        start_time = time.perf_counter()
+        result = (
+            db.execute(trends_query, {"user_id": user_id, "days": days})
+            .mappings()
+            .all()
+        )
+        query_time = (time.perf_counter() - start_time) * 1000
+
+        trends = []
+        for row in result:
+            trend_dict = dict(row)
+            if trend_dict.get("date"):
+                trend_dict["date"] = trend_dict["date"].isoformat()
+            trends.append(trend_dict)
+
+        # Only log slow queries
+        if query_time > 200:
+            logger.performance_metric(
+                metric="slow_trends_query",
+                value=query_time,
+                unit="ms",
+                properties={
+                    "days": days,
+                    "rows": len(trends),
+                },
+            )
+
+        return {
+            "trends": trends,
+            "days": days,
+            "data_points": len(trends),
+        }
+
+    except Exception as e:
+        logger.error(
+            "Failed to retrieve performance trends",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "user_id": user_id,
+                "days": days,
+            },
+            exc_info=True,
+        )
+        return {
+            "trends": [],
+            "days": days,
+            "data_points": 0,
+        }

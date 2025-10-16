@@ -1,12 +1,19 @@
-# app/api/users.py - Enhanced with comprehensive logging
+# app/api/users.py - Fixed version without decorator issues
 from __future__ import annotations
 
 import os
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Literal, Union
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, File, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+    File,
+    UploadFile,
+)
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -17,8 +24,8 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.user import User
 from app.services.log_service import LogService as ApplicationInsightsLogger
-from app.logging import get_logger, log_function, log_exceptions
-from app.logging.core import request_id_var, user_id_var
+from app.logging import get_logger
+from app.logging.core import user_id_var
 
 # Initialize structured logger
 logger = get_logger(__name__)
@@ -80,28 +87,6 @@ class UserProfileResponse(BaseModel):
     profile: Dict[str, Any]
 
 
-def get_client_ip(request: Request) -> str:
-    """Extract client IP address from request headers with logging"""
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        ip = forwarded_for.split(",")[0].strip()
-        logger.debug(f"Client IP extracted from X-Forwarded-For: {ip}")
-        return ip
-
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        logger.debug(f"Client IP extracted from X-Real-IP: {real_ip}")
-        return real_ip
-
-    if request and request.client:
-        ip = request.client.host
-        logger.debug(f"Client IP extracted from request.client: {ip}")
-        return ip
-
-    logger.warning("Unable to determine client IP address")
-    return "unknown"
-
-
 def _get_role_string(user: User) -> str:
     """Helper function to extract role as string"""
     role = getattr(user, "role", "user")
@@ -111,33 +96,14 @@ def _get_role_string(user: User) -> str:
 
 
 @router.get("/profile", response_model=UserProfileResponse)
-@log_function("get_user_profile")
-def get_profile(
-    request: Request,
+async def get_profile(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get user profile combining base user data and extended profile information"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "Profile retrieval request started",
-        context={
-            "user_id": str(current_user.id),
-            "client_ip": client_ip,
-            "user_email": current_user.email,
-        },
-    )
-
     try:
-        profile_start = time.time()
-
         # Build base user data
         base = {
             "id": str(current_user.id),
@@ -160,8 +126,7 @@ def get_profile(
             ),
         }
 
-        # Get extended profile information including DBC credentials
-        profile_query_start = time.time()
+        # Get extended profile information
         profile_query = text(
             """
             SELECT
@@ -194,15 +159,6 @@ def get_profile(
         profile_result = (
             db.execute(profile_query, {"uid": str(current_user.id)}).mappings().first()
         )
-        profile_query_time = (time.time() - profile_query_start) * 1000
-
-        logger.database_operation(
-            operation="SELECT",
-            table="user_profiles",
-            duration_ms=profile_query_time,
-            affected_rows=1 if profile_result else 0,
-            success=True,
-        )
 
         profile = dict(profile_result) if profile_result else {}
 
@@ -211,91 +167,24 @@ def get_profile(
             if hasattr(value, "isoformat"):
                 profile[key] = value.isoformat()
 
-        # Calculate profile completeness
-        populated_fields = len([v for v in profile.values() if v])
-        total_fields = len(profile) if profile else 1
-        completeness_percent = (populated_fields / total_fields) * 100
-
         # Add CAPTCHA status if DBC credentials exist
         captcha_enabled = profile.get("has_dbc_credentials", False)
         if captcha_enabled:
             profile["captcha_enabled"] = True
 
-        payload = {"user": base, "profile": profile}
-        total_time = (time.time() - profile_start) * 1000
-
-        logger.info(
-            "Profile retrieved successfully",
-            context={
-                "user_id": str(current_user.id),
-                "has_extended_profile": bool(profile),
-                "profile_completeness_percent": completeness_percent,
-                "has_captcha_credentials": captcha_enabled,
-                "total_duration_ms": total_time,
-            },
-        )
-
-        # Track detailed metrics
-        app_logger.track_metric(
-            name="profile_completeness",
-            value=completeness_percent,
-            properties={
-                "user_id": str(current_user.id),
-                "has_extended_profile": bool(profile),
-                "populated_fields": populated_fields,
-                "total_fields": total_fields,
-            },
-        )
-
-        # Track performance metrics
-        app_logger.track_metric(
-            name="profile_query_performance",
-            value=profile_query_time,
-            properties={"user_id": str(current_user.id), "has_profile": bool(profile)},
-        )
-
-        # Track business event
-        app_logger.track_business_event(
-            event_name="profile_retrieved",
-            properties={
-                "user_id": str(current_user.id),
-                "user_email": current_user.email,
-                "has_extended_profile": bool(profile),
-                "has_dbc_credentials": captcha_enabled,
-                "profile_fields_populated": populated_fields,
-                "user_role": _get_role_string(current_user),
-            },
-            metrics={
-                "query_time_ms": profile_query_time,
-                "total_time_ms": total_time,
-                "completeness_percent": completeness_percent,
-            },
-        )
-
-        # Track user action
-        app_logger.track_user_action(
-            action="view_profile",
-            target="user_profile",
-            properties={
-                "user_id": str(current_user.id),
-                "ip": client_ip,
-                "profile_exists": bool(profile),
-            },
-        )
-
-        return payload
+        return {"user": base, "profile": profile}
 
     except SQLAlchemyError as e:
         db.rollback()
         logger.error(
             "Database error retrieving profile",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve profile",
@@ -303,13 +192,13 @@ def get_profile(
     except Exception as e:
         logger.error(
             "Unexpected error retrieving profile",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve profile",
@@ -317,48 +206,27 @@ def get_profile(
 
 
 @router.put("/profile")
-@log_function("update_user_profile")
-def update_profile(
-    request: Request,
+async def update_profile(
     profile_data: ProfileUpdateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Update user profile information including DBC credentials"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    # Track what fields are being updated
-    updated_data = profile_data.model_dump(exclude_unset=True)
-    updated_fields = [k for k, v in updated_data.items() if v is not None]
-
-    # Check if DBC credentials are being updated
-    updating_dbc = "dbc_username" in updated_fields or "dbc_password" in updated_fields
-
-    logger.info(
-        "Profile update request started",
-        context={
-            "user_id": str(current_user.id),
-            "client_ip": client_ip,
-            "fields_to_update": updated_fields,
-            "update_count": len(updated_fields),
-            "updating_dbc_credentials": updating_dbc,
-            "user_email": current_user.email,
-        },
-    )
-
     try:
-        update_start = time.time()
+        # Track what fields are being updated
+        updated_data = profile_data.model_dump(exclude_unset=True)
+        updated_fields = [k for k, v in updated_data.items() if v is not None]
+
+        # Check if DBC credentials are being updated
+        updating_dbc = (
+            "dbc_username" in updated_fields or "dbc_password" in updated_fields
+        )
 
         # Update base user fields if provided
         user_updated = False
         user_changes = {}
-        user_update_start = time.time()
 
         if profile_data.first_name is not None:
             old_value = getattr(current_user, "first_name", None)
@@ -378,22 +246,11 @@ def update_profile(
                 "new": current_user.last_name,
             }
 
-        user_update_time = 0
         if user_updated:
             current_user.updated_at = datetime.utcnow()
             db.add(current_user)
-            user_update_time = (time.time() - user_update_start) * 1000
-
-            logger.database_operation(
-                operation="UPDATE",
-                table="users",
-                duration_ms=user_update_time,
-                affected_rows=1,
-                success=True,
-            )
 
         # Check if user profile exists
-        profile_check_start = time.time()
         profile_exists_query = text(
             """
             SELECT COUNT(*) FROM user_profiles WHERE user_id = :uid
@@ -401,14 +258,6 @@ def update_profile(
         )
         profile_exists = (
             db.execute(profile_exists_query, {"uid": str(current_user.id)}).scalar() > 0
-        )
-        profile_check_time = (time.time() - profile_check_start) * 1000
-
-        logger.database_operation(
-            operation="SELECT",
-            table="user_profiles",
-            duration_ms=profile_check_time,
-            success=True,
         )
 
         # Prepare profile data (excluding user table fields)
@@ -423,10 +272,7 @@ def update_profile(
                         value.strip() if isinstance(value, str) else value
                     )
 
-        profile_update_time = 0
         if profile_fields:
-            profile_update_start = time.time()
-
             if profile_exists:
                 # Update existing profile
                 update_parts = []
@@ -473,101 +319,28 @@ def update_profile(
                 )
                 db.execute(insert_query, profile_fields)
 
-            profile_update_time = (time.time() - profile_update_start) * 1000
-
-            logger.database_operation(
-                operation="UPDATE" if profile_exists else "INSERT",
-                table="user_profiles",
-                duration_ms=profile_update_time,
-                affected_rows=1,
-                success=True,
-            )
-
         db.commit()
-        total_update_time = (time.time() - update_start) * 1000
 
-        logger.info(
-            "Profile updated successfully",
-            context={
-                "user_id": str(current_user.id),
-                "fields_updated": updated_fields,
-                "user_fields_changed": list(user_changes.keys()),
-                "profile_fields_changed": list(profile_fields.keys()),
-                "profile_created": not profile_exists and bool(profile_fields),
-                "total_duration_ms": total_update_time,
-            },
-        )
-
-        # Track detailed business event
-        app_logger.track_business_event(
-            event_name="profile_updated",
-            properties={
-                "user_id": str(current_user.id),
-                "user_email": current_user.email,
-                "fields_updated": updated_fields,
-                "user_fields_changed": list(user_changes.keys()),
-                "profile_fields_changed": list(profile_fields.keys()),
-                "profile_created": not profile_exists and bool(profile_fields),
-                "dbc_credentials_updated": updating_dbc,
-                "ip_address": client_ip,
-            },
-            metrics={
-                "user_update_time_ms": user_update_time,
-                "profile_update_time_ms": profile_update_time,
-                "total_update_time_ms": total_update_time,
-                "fields_updated_count": len(updated_fields),
-                "profile_check_time_ms": profile_check_time,
-            },
-        )
-
-        # Log DBC update specifically for security monitoring
+        # Only log significant updates
         if updating_dbc:
-            app_logger.track_security_event(
-                event_name="dbc_credentials_updated",
-                user_id=str(current_user.id),
-                ip_address=client_ip,
-                success=True,
-                details={
-                    "has_username": bool(profile_data.dbc_username),
-                    "has_password": bool(profile_data.dbc_password),
-                    "username_changed": "dbc_username" in profile_fields,
-                    "password_changed": "dbc_password" in profile_fields,
-                },
-            )
-
             logger.info(
                 "DBC credentials updated",
-                context={
+                extra={
                     "user_id": str(current_user.id),
                     "has_username": bool(profile_data.dbc_username),
                     "has_password": bool(profile_data.dbc_password),
-                    "client_ip": client_ip,
                 },
             )
 
-        # Track user action
-        app_logger.track_user_action(
-            action="update_profile",
-            target="user_profile",
-            properties={
-                "user_id": str(current_user.id),
-                "fields_updated": updated_fields,
-                "field_count": len(updated_fields),
-                "updating_dbc": updating_dbc,
-                "ip": client_ip,
-            },
-        )
-
-        # Track performance metrics
-        app_logger.track_metric(
-            name="profile_update_performance",
-            value=total_update_time,
-            properties={
-                "fields_count": len(updated_fields),
-                "profile_existed": profile_exists,
-                "user_updated": user_updated,
-            },
-        )
+        # Only log profile creation
+        if not profile_exists and profile_fields:
+            logger.info(
+                "User profile created",
+                extra={
+                    "user_id": str(current_user.id),
+                    "fields_populated": len(profile_fields),
+                },
+            )
 
         return {
             "success": True,
@@ -584,14 +357,13 @@ def update_profile(
         db.rollback()
         logger.error(
             "Database error updating profile",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
-                "fields_being_updated": updated_fields,
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update profile",
@@ -599,14 +371,13 @@ def update_profile(
     except Exception as e:
         logger.error(
             "Unexpected error updating profile",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
-                "fields_being_updated": updated_fields,
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update profile",
@@ -615,31 +386,25 @@ def update_profile(
 
 @router.post("/upload-avatar")
 async def upload_avatar(
-    request: Request,
+    file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    file: UploadFile = File(...),
-) -> dict:  # Explicit return type
+) -> dict:
     """Upload user avatar/profile image"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
-
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
 
     # Validate file type
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
+    # Read file content first to check size
+    file_content = await file.read()
+
     # Validate file size (5MB limit)
-    if file.size and file.size > 5 * 1024 * 1024:
+    if len(file_content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File size must be less than 5MB")
 
     try:
-        # Read file content
-        file_content = await file.read()
         file_extension = (
             file.filename.split(".")[-1]
             if file.filename and "." in file.filename
@@ -665,6 +430,16 @@ async def upload_avatar(
         db.add(current_user)
         db.commit()
 
+        # Log avatar upload for audit
+        logger.info(
+            "Profile image uploaded",
+            extra={
+                "user_id": str(current_user.id),
+                "file_size": len(file_content),
+                "content_type": file.content_type,
+            },
+        )
+
         return {
             "profile_image_url": profile_image_url,
             "success": True,
@@ -678,34 +453,27 @@ async def upload_avatar(
 
     except Exception as e:
         db.rollback()
-        app_logger.track_exception(e, handled=True)
+        logger.error(
+            "Failed to upload avatar",
+            extra={
+                "user_id": str(current_user.id),
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail="Failed to upload image")
 
 
 @router.get("/stats")
-@log_function("get_user_stats")
-def get_user_stats(
-    request: Request,
+async def get_user_stats(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get user statistics and metrics"""
-    # Set context variables for structured logging
     user_id_var.set(str(current_user.id))
 
-    app_logger = ApplicationInsightsLogger(db)
-    app_logger.set_context(user_id=str(current_user.id))
-
-    client_ip = get_client_ip(request)
-
-    logger.info(
-        "User stats request started",
-        context={"user_id": str(current_user.id), "client_ip": client_ip},
-    )
-
     try:
-        stats_start = time.time()
-
         # Get campaign statistics
         campaigns_query = text(
             """
@@ -745,15 +513,6 @@ def get_user_stats(
             .first()
         )
 
-        stats_time = (time.time() - stats_start) * 1000
-
-        logger.database_operation(
-            operation="AGGREGATE",
-            table="campaigns,submissions",
-            duration_ms=stats_time,
-            success=True,
-        )
-
         # Build response
         stats = {
             "user_info": {
@@ -786,56 +545,29 @@ def get_user_stats(
                 total_submissions / total_campaigns, 2
             )
 
-        logger.info(
-            "User stats retrieved successfully",
-            context={
-                "user_id": str(current_user.id),
-                "total_campaigns": total_campaigns,
-                "total_submissions": total_submissions,
-                "success_rate": stats["calculated_metrics"].get(
-                    "overall_success_rate", 0
-                ),
-                "stats_duration_ms": stats_time,
-            },
-        )
-
-        # Track business event
-        app_logger.track_business_event(
-            event_name="user_stats_retrieved",
-            properties={
-                "user_id": str(current_user.id),
-                "user_email": current_user.email,
-                "ip_address": client_ip,
-            },
-            metrics={
-                "query_time_ms": stats_time,
-                "total_campaigns": total_campaigns,
-                "total_submissions": total_submissions,
-                "success_rate": stats["calculated_metrics"].get(
-                    "overall_success_rate", 0
-                ),
-            },
-        )
-
-        # Track user action
-        app_logger.track_user_action(
-            action="view_stats",
-            target="user_stats",
-            properties={"user_id": str(current_user.id), "ip": client_ip},
-        )
+        # Only log if there are concerning metrics
+        if stats["campaigns"].get("failed_campaigns", 0) > 5:
+            logger.warning(
+                "High failed campaign count",
+                extra={
+                    "user_id": str(current_user.id),
+                    "failed_campaigns": stats["campaigns"]["failed_campaigns"],
+                    "total_campaigns": total_campaigns,
+                },
+            )
 
         return stats
 
     except SQLAlchemyError as e:
         logger.error(
             "Database error retrieving user stats",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve user statistics",
@@ -843,13 +575,13 @@ def get_user_stats(
     except Exception as e:
         logger.error(
             "Unexpected error retrieving user stats",
-            context={
+            extra={
                 "user_id": str(current_user.id),
                 "error_type": type(e).__name__,
                 "error_message": str(e),
             },
+            exc_info=True,
         )
-        app_logger.track_exception(e, handled=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve user statistics",

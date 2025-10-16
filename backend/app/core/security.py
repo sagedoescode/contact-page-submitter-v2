@@ -1,5 +1,5 @@
 # app/core/security.py
-"""Centralized security module - Single source of truth for JWT"""
+"""Centralized security module - Fixed bcrypt handling"""
 
 import os
 import jwt
@@ -7,12 +7,12 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from passlib.context import CryptContext
 
-# Load the JWT secret - YOUR .env has JWT_SECRET, not SECRET_KEY
+# Load the JWT secret
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this").strip('"')
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256").strip('"')
 JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", "24"))
 
-# Password context
+# Password context - fixed configuration
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto",
@@ -25,17 +25,61 @@ print(f"[SECURITY] Expiration: {JWT_EXPIRATION_HOURS} hours")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
+    """Verify a password against its hash - handles bcrypt 72-byte limit"""
     try:
+        # Convert to bytes to check actual byte length
+        password_bytes = plain_password.encode("utf-8")
+
+        # If longer than 72 bytes, truncate at byte level
+        if len(password_bytes) > 72:
+            print(
+                f"[SECURITY] Password too long ({len(password_bytes)} bytes), truncating to 72 bytes"
+            )
+            # Truncate to 72 bytes and decode back to string
+            truncated_bytes = password_bytes[:72]
+            # Handle potential incomplete UTF-8 characters at the end
+            while len(truncated_bytes) > 0:
+                try:
+                    plain_password = truncated_bytes.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    # Remove the last byte and try again
+                    truncated_bytes = truncated_bytes[:-1]
+
         return pwd_context.verify(plain_password, hashed_password)
+
     except Exception as e:
         print(f"[SECURITY] Password verification error: {e}")
         return False
 
 
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
-    return pwd_context.hash(password)
+    """Hash a password - handles bcrypt 72-byte limit"""
+    try:
+        # Convert to bytes to check actual byte length
+        password_bytes = password.encode("utf-8")
+
+        # If longer than 72 bytes, truncate at byte level
+        if len(password_bytes) > 72:
+            print(
+                f"[SECURITY] Password too long ({len(password_bytes)} bytes), truncating to 72 bytes"
+            )
+            # Truncate to 72 bytes and decode back to string
+            truncated_bytes = password_bytes[:72]
+            # Handle potential incomplete UTF-8 characters at the end
+            while len(truncated_bytes) > 0:
+                try:
+                    password = truncated_bytes.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    # Remove the last byte and try again
+                    truncated_bytes = truncated_bytes[:-1]
+
+        return pwd_context.hash(password)
+
+    except Exception as e:
+        print(f"[SECURITY] Password hashing error: {e}")
+        raise
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

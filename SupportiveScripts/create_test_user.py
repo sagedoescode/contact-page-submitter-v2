@@ -18,7 +18,7 @@ first_name = "Test"
 last_name = "Login"
 
 # Hash the password
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 hashed_password = pwd_context.hash(password)
 
 print(f"Creating user: {email}")

@@ -1,460 +1,233 @@
-# app/services/submission_service.py
-"""Submission service with clean separation of concerns."""
+# app/services/submission_service.py - FIXED VERSION
+"""Submission service for managing form submissions."""
 
 import uuid
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
-
+from datetime import datetime
+from typing import List, Tuple, Optional, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, and_, or_, func
-from fastapi import HTTPException
-
-from app.models.submission import Submission, SubmissionStatus
-from app.models.logs import SubmissionLog
-from app.models.campaign import Campaign, CampaignStatus
-from app.models.user_profile import UserProfile
-from app.schemas.submission import SubmissionCreate, SubmissionUpdate
-
-from app.utils.url_validator import URLValidator
-from app.utils.status_converter import StatusConverter
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
 
 
 class SubmissionService:
-    """Service for managing form submissions."""
+    """Service for managing submissions."""
+
+    # Valid status values
+    VALID_STATUSES = {"pending", "processing", "completed", "failed", "retry"}
 
     def __init__(self, db: Session):
         self.db = db
-        self.url_validator = URLValidator()
-        self.status_converter = StatusConverter()
-
-    def create_submission(
-        self, user_id: uuid.UUID, submission_data: SubmissionCreate
-    ) -> Submission:
-        """Create a new submission."""
-        try:
-            # Validate URL
-            clean_url = self.url_validator.validate_and_normalize(submission_data.url)
-
-            # Validate campaign
-            if submission_data.campaign_id:
-                self._validate_campaign(submission_data.campaign_id, user_id)
-                self._check_duplicate_url(submission_data.campaign_id, clean_url)
-
-            # Convert status
-            status_enum = self.status_converter.to_enum(
-                submission_data.status or "pending"
-            )
-
-            # Create submission
-            submission = Submission(
-                website_id=submission_data.website_id,
-                campaign_id=submission_data.campaign_id,
-                user_id=user_id,
-                url=clean_url,
-                contact_method=submission_data.contact_method,
-                status=status_enum,
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            )
-
-            self.db.add(submission)
-            self.db.commit()
-            self.db.refresh(submission)
-
-            logger.info(f"Created submission {submission.id}")
-            self._log_event(
-                submission.id, "created", f"Submission created for {clean_url}"
-            )
-
-            return submission
-
-        except ValueError as e:
-            self.db.rollback()
-            raise HTTPException(status_code=400, detail=str(e))
-        except HTTPException:
-            self.db.rollback()
-            raise
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to create submission: {e}")
-            raise HTTPException(status_code=500, detail="Failed to create submission")
-
-    def get_submission(
-        self, submission_id: uuid.UUID, user_id: uuid.UUID
-    ) -> Optional[Submission]:
-        """Get a submission by ID."""
-        return (
-            self.db.query(Submission)
-            .filter(and_(Submission.id == submission_id, Submission.user_id == user_id))
-            .first()
-        )
-
-    def update_submission(
-        self,
-        submission_id: uuid.UUID,
-        user_id: uuid.UUID,
-        submission_data: SubmissionUpdate,
-    ) -> Optional[Submission]:
-        """Update a submission."""
-        try:
-            submission = self.get_submission(submission_id, user_id)
-            if not submission:
-                return None
-
-            # Check if modifiable
-            if not self._can_modify(submission):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot modify submission in {submission.status.value} status",
-                )
-
-            # Apply updates
-            update_data = submission_data.dict(exclude_unset=True)
-
-            if "url" in update_data:
-                update_data["url"] = self.url_validator.validate_and_normalize(
-                    update_data["url"]
-                )
-
-            if "status" in update_data:
-                update_data["status"] = self.status_converter.to_enum(
-                    update_data["status"]
-                )
-
-            for field, value in update_data.items():
-                setattr(submission, field, value)
-
-            submission.updated_at = datetime.utcnow()
-
-            # Set processing timestamps
-            self._update_timestamps(submission)
-
-            self.db.commit()
-            self.db.refresh(submission)
-
-            logger.info(f"Updated submission {submission_id}")
-            return submission
-
-        except HTTPException:
-            self.db.rollback()
-            raise
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to update submission: {e}")
-            raise HTTPException(status_code=500, detail="Failed to update submission")
 
     def bulk_create_submissions(
         self, user_id: uuid.UUID, campaign_id: uuid.UUID, urls: List[str]
-    ) -> Tuple[List[Submission], List[str]]:
-        """Bulk create submissions."""
-        try:
-            # Validate campaign
-            self._validate_campaign(campaign_id, user_id)
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """
+        Bulk create submissions from a list of URLs.
 
-            # Get existing URLs
-            existing_urls = self._get_existing_urls(campaign_id)
+        FIXED: Status field is now optional and defaults to 'pending'
+        """
+        submissions = []
+        errors = []
 
-            submissions = []
-            errors = []
+        logger.info(f"Creating submissions for {len(urls)} URLs")
 
-            for i, url in enumerate(urls):
-                try:
-                    clean_url = self.url_validator.validate_and_normalize(url)
+        for idx, url in enumerate(urls, 1):
+            try:
+                # Clean URL
+                url = url.strip()
+                if not url:
+                    errors.append(f"Row {idx}: Empty URL")
+                    continue
 
-                    if clean_url in existing_urls:
-                        errors.append(f"Row {i+1}: Duplicate URL")
-                        continue
+                # Create submission record
+                submission_id = str(uuid.uuid4())
+                now = datetime.utcnow()
 
-                    submission = Submission(
-                        campaign_id=campaign_id,
-                        user_id=user_id,
-                        url=clean_url,
-                        status=SubmissionStatus.PENDING,
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow(),
+                # Default status is always 'pending' - no validation needed from CSV
+                status = "pending"
+
+                insert_query = text(
+                    """
+                    INSERT INTO submissions (
+                        id, campaign_id, user_id, url, status,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :campaign_id, :user_id, :url, :status,
+                        :created_at, :updated_at
                     )
-                    submissions.append(submission)
-                    existing_urls.add(clean_url)
+                """
+                )
 
-                except ValueError as e:
-                    errors.append(f"Row {i+1}: {str(e)}")
+                self.db.execute(
+                    insert_query,
+                    {
+                        "id": submission_id,
+                        "campaign_id": str(campaign_id),
+                        "user_id": str(user_id),
+                        "url": url,
+                        "status": status,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
 
-            if submissions:
-                self.db.add_all(submissions)
-                self.db.commit()
+                submissions.append(
+                    {
+                        "id": submission_id,
+                        "url": url,
+                        "status": status,
+                        "created_at": now,
+                    }
+                )
 
-                for submission in submissions:
-                    self.db.refresh(submission)
+            except SQLAlchemyError as e:
+                error_msg = f"Row {idx}: Database error - {str(e)}"
+                errors.append(error_msg)
+                logger.error(error_msg)
+                continue
+            except Exception as e:
+                error_msg = f"Row {idx}: {str(e)}"
+                errors.append(error_msg)
+                logger.error(error_msg)
+                continue
 
-            logger.info(f"Bulk created {len(submissions)} submissions")
-            return submissions, errors
+        logger.info(f"Bulk created {len(submissions)} submissions")
+        if errors:
+            logger.warning(f"Encountered {len(errors)} errors during bulk creation")
 
-        except HTTPException:
-            self.db.rollback()
-            raise
+        return submissions, errors
+
+    def get_submission(
+        self, submission_id: uuid.UUID, user_id: Optional[uuid.UUID] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Get a submission by ID."""
+        try:
+            query = text(
+                """
+                SELECT * FROM submissions 
+                WHERE id = :submission_id
+            """
+            )
+
+            params = {"submission_id": str(submission_id)}
+
+            if user_id:
+                query = text(
+                    """
+                    SELECT * FROM submissions 
+                    WHERE id = :submission_id AND user_id = :user_id
+                """
+                )
+                params["user_id"] = str(user_id)
+
+            result = self.db.execute(query, params).mappings().first()
+            return dict(result) if result else None
+
+        except Exception as e:
+            logger.error(f"Error getting submission {submission_id}: {e}")
+            return None
+
+    def update_submission_status(
+        self,
+        submission_id: uuid.UUID,
+        status: str,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Update submission status."""
+        try:
+            # Validate status
+            if status not in self.VALID_STATUSES:
+                logger.error(f"Invalid status: {status}")
+                return False
+
+            query = text(
+                """
+                UPDATE submissions 
+                SET status = :status,
+                    error_message = :error_message,
+                    updated_at = :updated_at
+                WHERE id = :submission_id
+            """
+            )
+
+            self.db.execute(
+                query,
+                {
+                    "submission_id": str(submission_id),
+                    "status": status,
+                    "error_message": error_message,
+                    "updated_at": datetime.utcnow(),
+                },
+            )
+            self.db.commit()
+
+            logger.info(f"Updated submission {submission_id} to status: {status}")
+            return True
+
         except Exception as e:
             self.db.rollback()
-            logger.error(f"Failed to bulk create submissions: {e}")
-            raise HTTPException(status_code=500, detail="Failed to bulk create")
+            logger.error(f"Error updating submission status: {e}")
+            return False
 
     def get_campaign_submissions(
         self,
         campaign_id: uuid.UUID,
-        user_id: uuid.UUID,
-        page: int = 1,
-        per_page: int = 10,
-        **filters,
-    ) -> Tuple[List[Submission], int]:
-        """Get paginated campaign submissions."""
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Get submissions for a campaign."""
         try:
-            # Validate campaign
-            self._validate_campaign(campaign_id, user_id)
+            base_query = """
+                SELECT * FROM submissions 
+                WHERE campaign_id = :campaign_id
+            """
 
-            # Build query
-            query = self.db.query(Submission).filter(
-                Submission.campaign_id == campaign_id
-            )
+            params: Dict[str, Any] = {"campaign_id": str(campaign_id)}
 
-            # Apply filters
-            query = self._apply_filters(query, filters)
+            if status:
+                base_query += " AND status = :status"
+                params["status"] = status
 
-            # Get total and paginated results
-            total = query.count()
-            submissions = (
-                query.order_by(desc(Submission.created_at))
-                .offset((page - 1) * per_page)
-                .limit(per_page)
-                .all()
-            )
+            base_query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            params["limit"] = limit
+            params["offset"] = offset
 
-            return submissions, total
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to get campaign submissions: {e}")
-            raise HTTPException(status_code=500, detail="Failed to get submissions")
-
-    def get_user_profile_data(self, user_id: uuid.UUID) -> Dict[str, Any]:
-        """Get user profile data for form filling."""
-        try:
-            profile = (
-                self.db.query(UserProfile)
-                .filter(UserProfile.user_id == user_id)
-                .first()
-            )
-
-            if not profile:
-                return self._get_default_profile()
-
-            return {
-                "first_name": profile.first_name or "John",
-                "last_name": profile.last_name or "Doe",
-                "email": profile.email or "contact@example.com",
-                "phone_number": profile.phone_number or "",
-                "company_name": profile.company_name or "",
-                "subject": profile.subject or "Business Inquiry",
-                "message": profile.message or "I am interested in your services.",
-                "website_url": profile.website_url or "",
-            }
+            result = self.db.execute(text(base_query), params).mappings().all()
+            return [dict(row) for row in result]
 
         except Exception as e:
-            logger.error(f"Error getting user profile: {e}")
-            return self._get_default_profile()
+            logger.error(f"Error getting campaign submissions: {e}")
+            return []
 
-    def retry_failed_submissions(
-        self, campaign_id: uuid.UUID, user_id: uuid.UUID, max_retries: int = 3
-    ) -> Dict[str, Any]:
-        """Retry failed submissions."""
+    def delete_submission(
+        self, submission_id: uuid.UUID, user_id: Optional[uuid.UUID] = None
+    ) -> bool:
+        """Delete a submission."""
         try:
-            # Validate campaign
-            self._validate_campaign(campaign_id, user_id)
+            query = text("DELETE FROM submissions WHERE id = :submission_id")
+            params = {"submission_id": str(submission_id)}
 
-            # Get failed submissions
-            failed = (
-                self.db.query(Submission)
-                .filter(
-                    and_(
-                        Submission.campaign_id == campaign_id,
-                        Submission.status == SubmissionStatus.FAILED,
-                        Submission.retry_count < max_retries,
-                    )
+            if user_id:
+                query = text(
+                    "DELETE FROM submissions WHERE id = :submission_id AND user_id = :user_id"
                 )
-                .all()
-            )
+                params["user_id"] = str(user_id)
 
-            retried = 0
-            skipped = 0
-
-            for submission in failed:
-                if self._is_permanent_error(submission.error_message):
-                    skipped += 1
-                    continue
-
-                # Reset for retry
-                submission.status = SubmissionStatus.PENDING
-                submission.retry_count += 1
-                submission.error_message = None
-                submission.updated_at = datetime.utcnow()
-                submission.processed_at = None
-                submission.started_at = None
-
-                retried += 1
-
-                self._log_event(
-                    submission.id,
-                    "retry",
-                    f"Retry attempt {submission.retry_count}/{max_retries}",
-                )
-
+            result = self.db.execute(query, params)
             self.db.commit()
 
-            return {
-                "retried_count": retried,
-                "skipped_count": skipped,
-                "total_failed": len(failed),
-            }
+            if result.rowcount > 0:
+                logger.info(f"Deleted submission {submission_id}")
+                return True
+            else:
+                logger.warning(f"Submission {submission_id} not found or unauthorized")
+                return False
 
-        except HTTPException:
-            self.db.rollback()
-            raise
         except Exception as e:
             self.db.rollback()
-            logger.error(f"Failed to retry submissions: {e}")
-            raise HTTPException(status_code=500, detail="Failed to retry")
-
-    # Private helper methods
-
-    def _validate_campaign(self, campaign_id: uuid.UUID, user_id: uuid.UUID):
-        """Validate campaign exists and belongs to user."""
-        campaign = (
-            self.db.query(Campaign)
-            .filter(and_(Campaign.id == campaign_id, Campaign.user_id == user_id))
-            .first()
-        )
-
-        if not campaign:
-            raise HTTPException(status_code=404, detail="Campaign not found")
-
-        if campaign.status == CampaignStatus.COMPLETED:
-            raise HTTPException(
-                status_code=400, detail="Cannot modify completed campaign"
-            )
-
-        return campaign
-
-    def _check_duplicate_url(self, campaign_id: uuid.UUID, url: str):
-        """Check for duplicate URLs in campaign."""
-        existing = (
-            self.db.query(Submission)
-            .filter(and_(Submission.campaign_id == campaign_id, Submission.url == url))
-            .first()
-        )
-
-        if existing:
-            raise HTTPException(
-                status_code=400, detail="URL already exists in campaign"
-            )
-
-    def _get_existing_urls(self, campaign_id: uuid.UUID) -> set:
-        """Get existing URLs for a campaign."""
-        urls = (
-            self.db.query(Submission.url)
-            .filter(Submission.campaign_id == campaign_id)
-            .all()
-        )
-        return {url[0] for url in urls}
-
-    def _can_modify(self, submission: Submission) -> bool:
-        """Check if submission can be modified."""
-        return submission.status in [SubmissionStatus.PENDING, SubmissionStatus.FAILED]
-
-    def _update_timestamps(self, submission: Submission):
-        """Update submission timestamps based on status."""
-        if submission.status == SubmissionStatus.PROCESSING:
-            if not submission.started_at:
-                submission.started_at = datetime.utcnow()
-
-        elif submission.status in [SubmissionStatus.SUCCESS, SubmissionStatus.FAILED]:
-            if not submission.processed_at:
-                submission.processed_at = datetime.utcnow()
-
-    def _apply_filters(self, query, filters: Dict[str, Any]):
-        """Apply filters to query."""
-        if filters.get("status"):
-            status_enum = self.status_converter.to_enum(filters["status"])
-            query = query.filter(Submission.status == status_enum)
-
-        if filters.get("search_query"):
-            search = f"%{filters['search_query'].strip()}%"
-            query = query.filter(
-                or_(
-                    Submission.url.ilike(search),
-                    Submission.error_message.ilike(search),
-                    Submission.email_extracted.ilike(search),
-                )
-            )
-
-        return query
-
-    def _is_permanent_error(self, error_message: Optional[str]) -> bool:
-        """Check if error is permanent."""
-        if not error_message:
+            logger.error(f"Error deleting submission: {e}")
             return False
-
-        permanent_patterns = [
-            "invalid url",
-            "404",
-            "403",
-            "dns",
-            "certificate",
-            "ssl",
-            "no forms found",
-        ]
-
-        error_lower = error_message.lower()
-        return any(pattern in error_lower for pattern in permanent_patterns)
-
-    def _log_event(
-        self, submission_id: uuid.UUID, action: str, details: str, status: str = "info"
-    ):
-        """Log submission event."""
-        try:
-            submission = (
-                self.db.query(Submission).filter(Submission.id == submission_id).first()
-            )
-
-            if submission:
-                log = SubmissionLog(
-                    campaign_id=submission.campaign_id,
-                    submission_id=submission_id,
-                    user_id=submission.user_id,
-                    website_id=submission.website_id,
-                    target_url=submission.url,
-                    action=action,
-                    details=details,
-                    status=status,
-                    timestamp=datetime.utcnow(),
-                )
-
-                self.db.add(log)
-                self.db.commit()
-
-        except Exception as e:
-            logger.error(f"Failed to log event: {e}")
-
-    def _get_default_profile(self) -> Dict[str, Any]:
-        """Get default profile data."""
-        return {
-            "first_name": "John",
-            "last_name": "Doe",
-            "email": "contact@example.com",
-            "phone_number": "",
-            "company_name": "",
-            "subject": "Business Inquiry",
-            "message": "I am interested in your services.",
-            "website_url": "",
-        }

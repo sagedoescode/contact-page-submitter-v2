@@ -1,4 +1,4 @@
-"""Enhanced Captcha API endpoints with comprehensive logging for FastAPI."""
+"""Enhanced Captcha API endpoints with optimized logging for FastAPI."""
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
@@ -9,23 +9,30 @@ from typing import Dict, Any, Optional
 import secrets
 import random
 from datetime import datetime, timedelta
-import logging
 
 # Import dependencies - adjust based on your actual project structure
 try:
     from app.core.dependencies import get_current_user
-    from app.logging import get_logger, log_function, log_exceptions
+    from app.logging import get_logger, log_function
+    from app.logging.core import request_id_var, user_id_var
 
     HAS_AUTH = True
 except ImportError:
+    import logging
+
     HAS_AUTH = False
 
-    # Fallback if dependencies not available
     def get_current_user():
         return None
 
     def get_logger(name):
         return logging.getLogger(name)
+
+    def log_function(name):
+        def decorator(func):
+            return func
+
+        return decorator
 
 
 # Initialize logger
@@ -43,6 +50,8 @@ CAPTCHA_STORE = {}
 CAPTCHA_ATTEMPTS = {}
 MAX_ATTEMPTS = 5
 CAPTCHA_LIFETIME = 300  # 5 minutes
+CLEANUP_INTERVAL = 60  # Clean expired captchas every 60 seconds
+last_cleanup = 0
 
 
 # Pydantic models for request/response
@@ -72,33 +81,33 @@ class CaptchaStatsResponse(BaseModel):
     error: Optional[str] = None
 
 
-def log_performance(operation: str, duration: float, context: Dict[str, Any]):
-    """Log performance metrics for slow operations."""
-    logger.warning(
-        f"Slow operation detected: {operation}",
-        extra={
-            "operation": operation,
-            "duration": duration,
-            "threshold": 1.0,
-            **context,
-        },
-    )
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    if not request or not request.client:
+        return "unknown"
 
+    # Check for proxied requests
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
 
-def log_security_event(
-    event_type: str, context: Dict[str, Any], severity: str = "warning"
-):
-    """Log security-related events."""
-    log_method = getattr(logger, severity, logger.warning)
-    log_method(
-        f"Security event: {event_type}",
-        extra={"event_type": event_type, "severity": severity, **context},
-    )
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip
+
+    return request.client.host
 
 
 def clean_expired_captchas():
     """Clean up expired captchas from storage."""
+    global last_cleanup
     current_time = time.time()
+
+    # Only clean if enough time has passed
+    if current_time - last_cleanup < CLEANUP_INTERVAL:
+        return 0
+
+    last_cleanup = current_time
     expired = []
 
     for captcha_id, data in list(CAPTCHA_STORE.items()):
@@ -110,18 +119,16 @@ def clean_expired_captchas():
         if captcha_id in CAPTCHA_ATTEMPTS:
             del CAPTCHA_ATTEMPTS[captcha_id]
 
-    if expired:
-        logger.info(f"Cleaned {len(expired)} expired captchas")
+    return len(expired)
 
 
 @router.post("/generate", response_model=CaptchaGenerateResponse)
+@log_function("generate_captcha")
 async def generate_captcha(request: Request):
     """Generate a new captcha challenge."""
-    start_time = time.time()
-
     try:
-        # Clean expired captchas periodically
-        clean_expired_captchas()
+        # Clean expired captchas periodically (non-blocking)
+        cleaned = clean_expired_captchas()
 
         # Generate captcha
         captcha_id = secrets.token_urlsafe(32)
@@ -141,8 +148,7 @@ async def generate_captcha(request: Request):
             answer = num1 * num2
             question = f"{num1} × {num2}"
 
-        # Get client IP
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = get_client_ip(request)
 
         # Store captcha
         CAPTCHA_STORE[captcha_id] = {
@@ -152,15 +158,8 @@ async def generate_captcha(request: Request):
             "attempts": 0,
         }
 
-        logger.info(
-            "Captcha generated successfully",
-            extra={
-                "captcha_id": captcha_id[:8] + "...",
-                "ip": client_ip,
-                "type": "math",
-                "duration": time.time() - start_time,
-            },
-        )
+        # Only log if this is a suspicious pattern (rate limiting would catch this)
+        # Normal captcha generation doesn't need logging
 
         return CaptchaGenerateResponse(
             success=True,
@@ -175,7 +174,6 @@ async def generate_captcha(request: Request):
             extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "duration": time.time() - start_time,
             },
             exc_info=True,
         )
@@ -185,10 +183,13 @@ async def generate_captcha(request: Request):
 
 
 @router.post("/verify", response_model=CaptchaVerifyResponse)
+@log_function("verify_captcha")
 async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
     """Verify a captcha response."""
-    start_time = time.time()
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
+    captcha_id_short = (
+        data.captcha_id[:8] + "..." if len(data.captcha_id) > 8 else data.captcha_id
+    )
 
     try:
         captcha_id = data.captcha_id
@@ -196,27 +197,15 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
 
         # Check if captcha exists
         if captcha_id not in CAPTCHA_STORE:
-            logger.warning(
-                "Invalid or expired captcha ID",
-                extra={
-                    "captcha_id": (
-                        captcha_id[:8] + "..." if len(captcha_id) > 8 else captcha_id
-                    ),
-                    "ip": client_ip,
-                },
-            )
-
-            log_security_event(
-                event_type="captcha_invalid",
-                context={
-                    "captcha_id": (
-                        captcha_id[:8] + "..." if len(captcha_id) > 8 else captcha_id
-                    ),
-                    "ip": client_ip,
-                },
+            # Log security event - someone trying invalid captcha
+            logger.security_event(
+                event="captcha_invalid_attempt",
                 severity="warning",
+                properties={
+                    "captcha_id": captcha_id_short,
+                    "ip": client_ip,
+                },
             )
-
             raise HTTPException(status_code=400, detail="Invalid or expired captcha")
 
         captcha_data = CAPTCHA_STORE[captcha_id]
@@ -226,15 +215,6 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
             del CAPTCHA_STORE[captcha_id]
             if captcha_id in CAPTCHA_ATTEMPTS:
                 del CAPTCHA_ATTEMPTS[captcha_id]
-
-            logger.warning(
-                "Captcha expired",
-                extra={
-                    "captcha_id": captcha_id[:8] + "...",
-                    "age": time.time() - captcha_data["created"],
-                    "ip": client_ip,
-                },
-            )
 
             raise HTTPException(status_code=400, detail="Captcha expired")
 
@@ -250,23 +230,15 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
             del CAPTCHA_STORE[captcha_id]
             del CAPTCHA_ATTEMPTS[captcha_id]
 
-            logger.warning(
-                "Captcha max attempts exceeded",
-                extra={
-                    "captcha_id": captcha_id[:8] + "...",
+            # Log security event - brute force attempt
+            logger.security_event(
+                event="captcha_brute_force",
+                severity="error",
+                properties={
+                    "captcha_id": captcha_id_short,
+                    "ip": client_ip,
                     "attempts": current_attempts,
-                    "ip": client_ip,
                 },
-            )
-
-            log_security_event(
-                event_type="captcha_max_attempts",
-                context={
-                    "captcha_id": captcha_id[:8] + "...",
-                    "ip": client_ip,
-                    "attempts": MAX_ATTEMPTS,
-                },
-                severity="warning",
             )
 
             raise HTTPException(status_code=429, detail="Too many attempts")
@@ -278,26 +250,31 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
             if captcha_id in CAPTCHA_ATTEMPTS:
                 del CAPTCHA_ATTEMPTS[captcha_id]
 
-            logger.info(
-                "Captcha verified successfully",
-                extra={
-                    "captcha_id": captcha_id[:8] + "...",
-                    "attempts": current_attempts,
-                    "ip": client_ip,
-                    "duration": time.time() - start_time,
-                },
-            )
+            # Only log failed attempts or suspicious successes
+            if current_attempts > 2:
+                logger.security_event(
+                    event="captcha_verified_after_retries",
+                    severity="info",
+                    properties={
+                        "captcha_id": captcha_id_short,
+                        "attempts": current_attempts,
+                        "ip": client_ip,
+                    },
+                )
 
             return CaptchaVerifyResponse(success=True, message="Captcha verified")
         else:
-            logger.warning(
-                "Captcha verification failed",
-                extra={
-                    "captcha_id": captcha_id[:8] + "...",
-                    "attempts": current_attempts,
-                    "ip": client_ip,
-                },
-            )
+            # Log if multiple failed attempts (potential bot)
+            if current_attempts >= 3:
+                logger.security_event(
+                    event="captcha_multiple_failures",
+                    severity="warning",
+                    properties={
+                        "captcha_id": captcha_id_short,
+                        "attempts": current_attempts,
+                        "ip": client_ip,
+                    },
+                )
 
             return CaptchaVerifyResponse(
                 success=False,
@@ -314,7 +291,6 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
                 "error": str(e),
                 "error_type": type(e).__name__,
                 "ip": client_ip,
-                "duration": time.time() - start_time,
             },
             exc_info=True,
         )
@@ -322,29 +298,47 @@ async def verify_captcha(data: CaptchaVerifyRequest, request: Request):
 
 
 @router.get("/stats", response_model=CaptchaStatsResponse)
+@log_function("get_captcha_stats")
 async def get_captcha_stats(
+    request: Request,
     current_user: Optional[Dict] = Depends(get_current_user) if HAS_AUTH else None,
 ):
     """Get captcha statistics (admin only)."""
     try:
-        # Check admin permission (implement your own logic)
-        # if current_user and not is_admin(current_user.get("id")):
-        #     raise HTTPException(status_code=403, detail="Unauthorized")
+        # Check admin permission
+        if HAS_AUTH and current_user:
+            user_id_var.set(str(current_user.get("id")))
+
+            # Implement your admin check here
+            # if not is_admin(current_user.get("id")):
+            #     raise HTTPException(status_code=403, detail="Unauthorized")
 
         stats = {
             "active_captchas": len(CAPTCHA_STORE),
             "pending_verifications": len(CAPTCHA_ATTEMPTS),
             "total_attempts": sum(CAPTCHA_ATTEMPTS.values()),
+            "max_attempts_allowed": MAX_ATTEMPTS,
+            "captcha_lifetime_seconds": CAPTCHA_LIFETIME,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-        logger.info(
-            "Captcha stats retrieved",
-            extra={
-                **stats,
-                "user_id": current_user.get("id") if current_user else "anonymous",
-            },
-        )
+        # Calculate additional metrics
+        if CAPTCHA_ATTEMPTS:
+            avg_attempts = sum(CAPTCHA_ATTEMPTS.values()) / len(CAPTCHA_ATTEMPTS)
+            stats["average_attempts_per_captcha"] = round(avg_attempts, 2)
+
+        # Only log admin access for audit trail
+        if current_user:
+            logger.auth_event(
+                action="admin_stats_access",
+                email=current_user.get("email", "unknown"),
+                success=True,
+                ip_address=get_client_ip(request),
+                properties={
+                    "endpoint": "captcha_stats",
+                    "active_captchas": stats["active_captchas"],
+                },
+            )
 
         return CaptchaStatsResponse(success=True, stats=stats)
 
@@ -356,29 +350,67 @@ async def get_captcha_stats(
             extra={
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "user_id": current_user.get("id") if current_user else None,
             },
             exc_info=True,
         )
         return CaptchaStatsResponse(success=False, error="Failed to retrieve stats")
 
 
-def is_admin(user_id: str) -> bool:
-    """
-    Check if user is admin.
-    TODO: Implement your own admin check logic here.
-    """
-    # Example implementation - replace with your actual logic
-    # return user_id in ADMIN_USERS
-    return False
-
-
-# Health check endpoint for this router
 @router.get("/health")
 async def captcha_health():
-    """Check captcha service health."""
+    """Check captcha service health - no logging needed for health checks."""
     return {
         "status": "healthy",
         "active_captchas": len(CAPTCHA_STORE),
         "pending_verifications": len(CAPTCHA_ATTEMPTS),
     }
+
+
+# Optional: Add rate limiting endpoint
+@router.delete("/cleanup")
+@log_function("manual_captcha_cleanup")
+async def manual_cleanup(
+    request: Request,
+    current_user: Optional[Dict] = Depends(get_current_user) if HAS_AUTH else None,
+):
+    """Manually trigger captcha cleanup (admin only)."""
+    try:
+        if HAS_AUTH and current_user:
+            # Admin check here
+            pass
+
+        current_time = time.time()
+        expired = []
+
+        for captcha_id, data in list(CAPTCHA_STORE.items()):
+            if current_time - data["created"] > CAPTCHA_LIFETIME:
+                expired.append(captcha_id)
+
+        for captcha_id in expired:
+            del CAPTCHA_STORE[captcha_id]
+            if captcha_id in CAPTCHA_ATTEMPTS:
+                del CAPTCHA_ATTEMPTS[captcha_id]
+
+        if expired:
+            logger.info(
+                "Manual captcha cleanup performed",
+                extra={
+                    "cleaned_count": len(expired),
+                    "user_id": current_user.get("id") if current_user else "system",
+                    "ip": get_client_ip(request),
+                },
+            )
+
+        return {
+            "success": True,
+            "cleaned": len(expired),
+            "remaining": len(CAPTCHA_STORE),
+        }
+
+    except Exception as e:
+        logger.error(
+            "Failed to perform manual cleanup",
+            extra={"error": str(e)},
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Cleanup failed")

@@ -21,12 +21,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# Configure basic logging first
+# Set environment variables BEFORE any imports
+os.environ["SQLALCHEMY_ECHO"] = "false"
+os.environ["SQLALCHEMY_WARN_20"] = "0"
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# Suppress SQLAlchemy logs
+logging.getLogger("sqlalchemy").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.dialects").setLevel(logging.ERROR)
+logging.getLogger("sqlalchemy.orm").setLevel(logging.ERROR)
+
+from pathlib import Path
+import sys
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -48,8 +64,8 @@ def _parse_cors_origins() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://localhost:8001",
-        "http://127.0.0.1:8001",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
     ]
 
     raw = os.getenv("CORS_ORIGINS", "").strip()
@@ -151,103 +167,93 @@ async def lifespan(app: FastAPI):
 # ----------------------------
 # Router Registration Function
 # ----------------------------
-# Add this to your main.py register_routers function
-
-
 def register_routers(app: FastAPI) -> None:
     """Register all available routers with proper error handling."""
     logger = get_logger("app.routers")
+    logger.info("Starting router registration process...")
     registered_count = 0
 
-    # Core routers (these MUST work)
-    core_routers = [
-        ("auth", "/api/auth", ["authentication"]),
-        ("users", "/api/users", ["users"]),
-    ]
+    # Test campaigns router specifically
+    logger.info("Attempting to register campaigns router...")
+    try:
+        from app.api.campaigns import router as campaigns_router
 
-    for router_name, prefix, tags in core_routers:
-        try:
-            if router_name == "auth":
-                from app.api.auth import router as auth_router
+        logger.info(
+            f"Campaigns router imported successfully. Routes: {len(campaigns_router.routes)}"
+        )
+        logger.info(
+            f"Campaigns router prefix: {getattr(campaigns_router, 'prefix', 'None')}"
+        )
 
-                app.include_router(auth_router, prefix=prefix, tags=tags)
-            elif router_name == "users":
-                from app.api.users import router as users_router
+        # Don't add prefix - the router already has one
+        app.include_router(campaigns_router)
+        logger.info("✅ Campaigns router registered successfully")
+        registered_count += 1
+    except ImportError as e:
+        logger.error(f"❌ Failed to import campaigns router: {e}")
+    except Exception as e:
+        logger.error(f"❌ Failed to register campaigns router: {e}")
+        import traceback
 
-                app.include_router(users_router, prefix=prefix, tags=tags)
+        logger.error(traceback.format_exc())
 
-            logger.info(f"✅ {router_name.title()} router registered at {prefix}")
-            registered_count += 1
+    # Test analytics router specifically
+    logger.info("Attempting to register analytics router...")
+    try:
+        from app.api.analytics import router as analytics_router
 
-        except ImportError as e:
-            logger.error(f"❌ CRITICAL: {router_name} router failed to import: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"❌ CRITICAL: {router_name} router registration failed: {e}")
-            raise
+        logger.info(
+            f"Analytics router imported successfully. Routes: {len(analytics_router.routes)}"
+        )
+        logger.info(
+            f"Analytics router prefix: {getattr(analytics_router, 'prefix', 'None')}"
+        )
 
-    # Optional routers (won't break the app if missing)
-    # CHANGE TO:
-    optional_routers = [
-        ("campaigns", "", ["campaigns"]),  # No prefix - defined in router
-        ("analytics", "", ["analytics"]),  # Analytics router
-        ("admin", "", ["admin"]),
-        ("submissions", "/submissions", ["submissions"]),  # ✅ Added /
-        ("health", "/health", ["health"]),  # ✅ Added /
-        ("websocket", "/ws", ["websocket"]),  # ✅ Added /
-        ("captcha", "/captcha", ["captcha"]),  # ✅ Added /
-    ]
+        # Don't add prefix - the router already has one
+        app.include_router(analytics_router)
+        logger.info("✅ Analytics router registered successfully")
+        registered_count += 1
+    except ImportError as e:
+        logger.error(f"❌ Failed to import analytics router: {e}")
+    except Exception as e:
+        logger.error(f"❌ Failed to register analytics router: {e}")
+        import traceback
 
-    for router_name, prefix, tags in optional_routers:
-        try:
-            router_module = None
+        logger.error(traceback.format_exc())
 
-            if router_name == "campaigns":
-                from app.api.campaigns import router as campaigns_router
+    # Auth router (keep existing logic)
+    try:
+        from app.api.auth import router as auth_router
 
-                router_module = campaigns_router
-            elif router_name == "analytics":  # ADDED: Analytics import
-                from app.api.analytics import router as analytics_router
+        # Check if auth router already has a prefix
+        if hasattr(auth_router, "prefix") and auth_router.prefix:
+            app.include_router(auth_router)
+            logger.info(
+                f"✅ Auth router registered with existing prefix: {auth_router.prefix}"
+            )
+        else:
+            app.include_router(auth_router, prefix="/api/auth", tags=["authentication"])
+            logger.info("✅ Auth router registered at /api/auth")
+        registered_count += 1
+    except Exception as e:
+        logger.error(f"❌ Auth router failed: {e}")
+        raise
 
-                router_module = analytics_router
-            elif router_name == "admin":
-                from app.api.admin import router as admin_router
+    # Users router (keep existing logic)
+    try:
+        from app.api.users import router as users_router
 
-                router_module = admin_router
-            elif router_name == "submissions":
-                from app.api.submissions import router as submissions_router
-
-                router_module = submissions_router
-            elif router_name == "health":
-                from app.api.health import router as health_router
-
-                router_module = health_router
-            elif router_name == "websocket":
-                from app.api.websocket import router as websocket_router
-
-                router_module = websocket_router
-            elif router_name == "captcha":
-                from app.api.captcha import router as captcha_router
-
-                router_module = captcha_router
-
-            if router_module:
-                if prefix:
-                    app.include_router(router_module, prefix=prefix, tags=tags)
-                    logger.info(
-                        f"✅ {router_name.title()} router registered at {prefix}"
-                    )
-                else:
-                    app.include_router(router_module, tags=tags)
-                    logger.info(
-                        f"✅ {router_name.title()} router registered (self-prefixed)"
-                    )
-                registered_count += 1
-
-        except ImportError:
-            logger.warning(f"⚠️ {router_name.title()} router not found - skipping")
-        except Exception as e:
-            logger.warning(f"⚠️ {router_name.title()} router registration failed: {e}")
+        if hasattr(users_router, "prefix") and users_router.prefix:
+            app.include_router(users_router)
+            logger.info(
+                f"✅ Users router registered with existing prefix: {users_router.prefix}"
+            )
+        else:
+            app.include_router(users_router, prefix="/api/users", tags=["users"])
+            logger.info("✅ Users router registered at /api/users")
+        registered_count += 1
+    except Exception as e:
+        logger.error(f"❌ Users router failed: {e}")
 
     logger.info(
         f"📊 Router registration complete: {registered_count} routers registered"
@@ -293,7 +299,7 @@ def create_app() -> FastAPI:
     # Register all routers
     register_routers(app)
 
-    # Built-in health check endpoint (in case health router fails)
+    # Built-in health check endpoint
     @app.get("/health")
     async def health_check():
         """Built-in health check endpoint."""
@@ -346,6 +352,28 @@ def create_app() -> FastAPI:
             },
         }
 
+    # Debug endpoint to check loaded routes
+    @app.get("/debug/routes")
+    async def debug_routes():
+        """Debug endpoint to list all registered routes."""
+        routes_info = []
+        for route in app.router.routes:
+            if hasattr(route, "methods") and hasattr(route, "path"):
+                route_info = {
+                    "path": route.path,
+                    "methods": list(route.methods) if route.methods else [],
+                    "name": route.name if hasattr(route, "name") else None,
+                    "endpoint": (
+                        str(route.endpoint) if hasattr(route, "endpoint") else None
+                    ),
+                }
+                routes_info.append(route_info)
+
+        return {
+            "total_routes": len(routes_info),
+            "routes": sorted(routes_info, key=lambda x: x["path"]),
+        }
+
     # Add startup event to log registered routes
     @app.on_event("startup")
     async def log_registered_routes():
@@ -358,7 +386,7 @@ def create_app() -> FastAPI:
 
         for route in app.router.routes:
             if hasattr(route, "methods") and hasattr(route, "path"):
-                methods = sorted(list(route.methods))
+                methods = sorted(list(route.methods)) if route.methods else []
                 path = route.path
 
                 # Group by prefix
@@ -373,7 +401,7 @@ def create_app() -> FastAPI:
         for prefix in sorted(routes_by_prefix.keys()):
             route_logger.info(f"📁 Routes for {prefix}:")
             for route in sorted(routes_by_prefix[prefix]):
-                route_logger.info(f"  🔗 {route}")
+                route_logger.info(f"  📗 {route}")
 
         route_logger.info(f"✅ Total registered routes: {route_count}")
 
@@ -394,7 +422,7 @@ if __name__ == "__main__":
 
     # Configuration from environment
     host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8001"))
+    port = int(os.getenv("PORT", "8000"))
     reload = os.getenv("RELOAD", "true").lower() == "true"
     log_level = os.getenv("LOG_LEVEL", "info").lower()
 
@@ -404,6 +432,7 @@ if __name__ == "__main__":
     print(f"📊 Log Level: {log_level}")
     print(f"📚 Documentation: http://{host}:{port}/docs")
     print(f"🏠 Root endpoint: http://{host}:{port}/")
+    print(f"🐛 Debug routes: http://{host}:{port}/debug/routes")
 
     uvicorn.run(
         "app.main:app",

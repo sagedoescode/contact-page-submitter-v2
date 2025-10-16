@@ -29,7 +29,7 @@ DeathByCaptcha account (optional, for CAPTCHA solving)
 yarn install 3. Configure environment variables
 bashcp .env.example .env
 Edit .env and add your configuration:
-envVITE_API_BASE=http://localhost:8001 4. Start the development server
+envVITE_API_BASE=http://localhost:8000 4. Start the development server
 bashnpm run dev
 
 # or

@@ -165,7 +165,7 @@ export const AuthProvider = ({ children }) => {
 const getErrorMessage = (error, action = 'operation') => {
   // Handle network errors first
   if (error.code === "ERR_NETWORK" || error.code === "ECONNABORTED") {
-    return "Cannot connect to server. Please ensure the backend is running on http://127.0.0.1:8001";
+    return "Cannot connect to server. Please ensure the backend is running on http://127.0.0.1:8000";
   }
 
   // Handle HTTP response errors
