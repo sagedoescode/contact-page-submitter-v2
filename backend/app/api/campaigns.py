@@ -39,6 +39,93 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/campaigns", tags=["campaigns"], redirect_slashes=False)
 
 
+def get_user_profile_for_campaign(db: Session, user_id: UUID) -> Dict[str, Any]:
+    """Fetch comprehensive user profile data for campaign form filling."""
+    try:
+        query = text("""
+            SELECT 
+                u.first_name, u.last_name, u.email,
+                up.phone_number, up.company_name, up.job_title,
+                up.website_url, up.linkedin_url, up.industry,
+                up.city, up.state, up.zip_code, up.country,
+                up.subject, up.message, up.budget_range,
+                up.product_interest, up.referral_source,
+                up.preferred_contact, up.best_time_to_contact,
+                up.language, up.preferred_language,
+                up.form_custom_field_1, up.form_custom_field_2, up.form_custom_field_3,
+                up.dbc_username, up.dbc_password
+            FROM users u
+            LEFT JOIN user_profiles up ON u.id = up.user_id
+            WHERE u.id = :user_id
+        """)
+
+        result = db.execute(query, {"user_id": str(user_id)}).mappings().first()
+
+        if result:
+            return {
+                "first_name": result["first_name"] or "User",
+                "last_name": result["last_name"] or "",
+                "email": result["email"] or "contact@example.com",
+                "phone_number": result["phone_number"] or "",
+                "company_name": result["company_name"] or "",
+                "job_title": result["job_title"] or "",
+                "website_url": result["website_url"] or "",
+                "linkedin_url": result["linkedin_url"] or "",
+                "industry": result["industry"] or "",
+                "city": result["city"] or "",
+                "state": result["state"] or "",
+                "zip_code": result["zip_code"] or "",
+                "country": result["country"] or "",
+                "subject": result["subject"] or "Business Inquiry",
+                "message": result["message"] or "I would like to discuss business opportunities.",
+                "budget_range": result["budget_range"] or "",
+                "product_interest": result["product_interest"] or "",
+                "referral_source": result["referral_source"] or "",
+                "preferred_contact": result["preferred_contact"] or "",
+                "best_time_to_contact": result["best_time_to_contact"] or "",
+                "language": result["language"] or "",
+                "preferred_language": result["preferred_language"] or "",
+                "form_custom_field_1": result["form_custom_field_1"] or "",
+                "form_custom_field_2": result["form_custom_field_2"] or "",
+                "form_custom_field_3": result["form_custom_field_3"] or "",
+                "dbc_username": result["dbc_username"] or "",
+                "dbc_password": result["dbc_password"] or "",
+            }
+    except Exception as e:
+        logger.warning(f"Could not fetch user profile: {e}")
+
+    # Default profile if user not found or error
+    return {
+        "first_name": "User",
+        "last_name": "",
+        "email": "contact@example.com",
+        "phone_number": "",
+        "company_name": "",
+        "job_title": "",
+        "website_url": "",
+        "linkedin_url": "",
+        "industry": "",
+        "city": "",
+        "state": "",
+        "zip_code": "",
+        "country": "",
+        "subject": "Business Inquiry",
+        "message": "I would like to discuss business opportunities.",
+        "budget_range": "",
+        "product_interest": "",
+        "referral_source": "",
+        "preferred_contact": "",
+        "best_time_to_contact": "",
+        "language": "",
+        "preferred_language": "",
+        "form_custom_field_1": "",
+        "form_custom_field_2": "",
+        "form_custom_field_3": "",
+        "dbc_username": "",
+        "dbc_password": "",
+    }
+
+
 def get_client_ip(request: Request) -> str:
     """Extract client IP address from request headers"""
     if not request:
@@ -145,6 +232,10 @@ async def start_campaign_with_csv(
         )
         logger.info(f"âœ… Campaign record created in database")
 
+        # Fetch user profile data for form filling
+        user_profile = get_user_profile_for_campaign(db, user.id)
+        logger.info(f"📋 User profile loaded: {user_profile.get('first_name', 'Unknown')} {user_profile.get('last_name', '')}")
+
         # Create submissions
         submission_service = SubmissionService(db)
         try:
@@ -240,6 +331,7 @@ async def start_campaign_with_csv(
             "status": "PROCESSING" if automation_started else "FAILED",
             "automation_started": automation_started,
             "automation_error": automation_error,
+            "user_profile": user_profile,
             "processing_report": {
                 "valid_urls": processing_report.get("valid_urls", 0),
                 "duplicates_removed": processing_report.get("duplicates_removed", 0),

@@ -102,6 +102,14 @@ class ApiService {
     return this.makeRequest('get', '/api/auth/me');
   }
 
+  async getUserProfile() {
+    return this.makeRequest('get', '/api/users/profile');
+  }
+
+  async updateUserProfile(data) {
+    return this.makeRequest('put', '/api/users/profile', data);
+  }
+
   // ============= CAMPAIGNS =============
   async getCampaigns(params = {}) {
     try {

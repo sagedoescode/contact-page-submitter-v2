@@ -48,14 +48,21 @@ def get_db_session():
 
 
 def get_user_profile(db, user_id: str) -> Dict:
-    """Fetch user profile from database for form filling."""
+    """Fetch comprehensive user profile from database for form filling."""
     try:
         query = text(
             """
             SELECT 
                 u.first_name, u.last_name, u.email,
                 up.phone_number, up.company_name, up.job_title,
-                up.message, up.subject, up.website_url
+                up.website_url, up.linkedin_url, up.industry,
+                up.city, up.state, up.zip_code, up.country,
+                up.subject, up.message, up.budget_range,
+                up.product_interest, up.referral_source,
+                up.preferred_contact, up.best_time_to_contact,
+                up.language, up.preferred_language,
+                up.form_custom_field_1, up.form_custom_field_2, up.form_custom_field_3,
+                up.dbc_username, up.dbc_password
             FROM users u
             LEFT JOIN user_profiles up ON u.id = up.user_id
             WHERE u.id = :user_id
@@ -72,10 +79,27 @@ def get_user_profile(db, user_id: str) -> Dict:
                 "phone_number": result["phone_number"] or "",
                 "company_name": result["company_name"] or "",
                 "job_title": result["job_title"] or "",
-                "message": result["message"]
-                or "I would like to discuss business opportunities.",
-                "subject": result["subject"] or "Business Inquiry",
                 "website_url": result["website_url"] or "",
+                "linkedin_url": result["linkedin_url"] or "",
+                "industry": result["industry"] or "",
+                "city": result["city"] or "",
+                "state": result["state"] or "",
+                "zip_code": result["zip_code"] or "",
+                "country": result["country"] or "",
+                "subject": result["subject"] or "Business Inquiry",
+                "message": result["message"] or "I would like to discuss business opportunities.",
+                "budget_range": result["budget_range"] or "",
+                "product_interest": result["product_interest"] or "",
+                "referral_source": result["referral_source"] or "",
+                "preferred_contact": result["preferred_contact"] or "",
+                "best_time_to_contact": result["best_time_to_contact"] or "",
+                "language": result["language"] or "",
+                "preferred_language": result["preferred_language"] or "",
+                "form_custom_field_1": result["form_custom_field_1"] or "",
+                "form_custom_field_2": result["form_custom_field_2"] or "",
+                "form_custom_field_3": result["form_custom_field_3"] or "",
+                "dbc_username": result["dbc_username"] or "",
+                "dbc_password": result["dbc_password"] or "",
             }
     except Exception as e:
         logger.warning(f"Could not fetch user profile: {e}")
@@ -88,9 +112,27 @@ def get_user_profile(db, user_id: str) -> Dict:
         "phone_number": "",
         "company_name": "",
         "job_title": "",
-        "message": "I would like to discuss business opportunities.",
-        "subject": "Business Inquiry",
         "website_url": "",
+        "linkedin_url": "",
+        "industry": "",
+        "city": "",
+        "state": "",
+        "zip_code": "",
+        "country": "",
+        "subject": "Business Inquiry",
+        "message": "I would like to discuss business opportunities.",
+        "budget_range": "",
+        "product_interest": "",
+        "referral_source": "",
+        "preferred_contact": "",
+        "best_time_to_contact": "",
+        "language": "",
+        "preferred_language": "",
+        "form_custom_field_1": "",
+        "form_custom_field_2": "",
+        "form_custom_field_3": "",
+        "dbc_username": "",
+        "dbc_password": "",
     }
 
 
@@ -336,7 +378,7 @@ async def process_with_playwright(
                         logger.info("Attempting to fill form...")
                         fields_filled = 0
 
-                        # Define field mappings
+                        # Define comprehensive field mappings
                         field_mappings = [
                             # Email fields
                             {
@@ -382,6 +424,105 @@ async def process_with_playwright(
                                 "value": user_profile.get("company_name", ""),
                                 "name": "company",
                             },
+                            # Job title fields
+                            {
+                                "selectors": [
+                                    'input[name*="title" i]',
+                                    'input[id*="title" i]',
+                                    'input[placeholder*="title" i]',
+                                    'input[name*="position" i]',
+                                    'input[name*="role" i]',
+                                ],
+                                "value": user_profile.get("job_title", ""),
+                                "name": "job_title",
+                            },
+                            # Website fields
+                            {
+                                "selectors": [
+                                    'input[name*="website" i]',
+                                    'input[id*="website" i]',
+                                    'input[placeholder*="website" i]',
+                                    'input[name*="url" i]',
+                                ],
+                                "value": user_profile.get("website_url", ""),
+                                "name": "website",
+                            },
+                            # Industry fields
+                            {
+                                "selectors": [
+                                    'input[name*="industry" i]',
+                                    'input[id*="industry" i]',
+                                    'input[placeholder*="industry" i]',
+                                    'select[name*="industry" i]',
+                                ],
+                                "value": user_profile.get("industry", ""),
+                                "name": "industry",
+                            },
+                            # City fields
+                            {
+                                "selectors": [
+                                    'input[name*="city" i]',
+                                    'input[id*="city" i]',
+                                    'input[placeholder*="city" i]',
+                                ],
+                                "value": user_profile.get("city", ""),
+                                "name": "city",
+                            },
+                            # State fields
+                            {
+                                "selectors": [
+                                    'input[name*="state" i]',
+                                    'input[id*="state" i]',
+                                    'input[placeholder*="state" i]',
+                                    'select[name*="state" i]',
+                                ],
+                                "value": user_profile.get("state", ""),
+                                "name": "state",
+                            },
+                            # Country fields
+                            {
+                                "selectors": [
+                                    'input[name*="country" i]',
+                                    'input[id*="country" i]',
+                                    'input[placeholder*="country" i]',
+                                    'select[name*="country" i]',
+                                ],
+                                "value": user_profile.get("country", ""),
+                                "name": "country",
+                            },
+                            # ZIP code fields
+                            {
+                                "selectors": [
+                                    'input[name*="zip" i]',
+                                    'input[id*="zip" i]',
+                                    'input[placeholder*="zip" i]',
+                                    'input[name*="postal" i]',
+                                ],
+                                "value": user_profile.get("zip_code", ""),
+                                "name": "zip_code",
+                            },
+                            # Budget fields
+                            {
+                                "selectors": [
+                                    'input[name*="budget" i]',
+                                    'input[id*="budget" i]',
+                                    'input[placeholder*="budget" i]',
+                                    'select[name*="budget" i]',
+                                ],
+                                "value": user_profile.get("budget_range", ""),
+                                "name": "budget",
+                            },
+                            # Product interest fields
+                            {
+                                "selectors": [
+                                    'input[name*="interest" i]',
+                                    'input[id*="interest" i]',
+                                    'input[placeholder*="interest" i]',
+                                    'textarea[name*="interest" i]',
+                                ],
+                                "value": user_profile.get("product_interest", ""),
+                                "name": "interest",
+                            },
                             # Message/textarea fields
                             {
                                 "selectors": [
@@ -389,6 +530,7 @@ async def process_with_playwright(
                                     'input[name*="message" i]',
                                     'input[id*="message" i]',
                                     'textarea[name*="comment" i]',
+                                    'textarea[name*="inquiry" i]',
                                 ],
                                 "value": user_profile["message"],
                                 "name": "message",

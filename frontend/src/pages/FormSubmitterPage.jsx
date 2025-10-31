@@ -3,7 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { 
   Upload, FileText, Send, AlertCircle, CheckCircle2, 
-  ArrowLeft, Target, Globe, Clock, BarChart3, X
+  ArrowLeft, Target, Globe, Clock, BarChart3, X, User
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import apiService from '../services/api';
@@ -35,6 +35,13 @@ const FormSubmitterPage = () => {
   const [processingCampaignId, setProcessingCampaignId] = useState(null);
   const [campaignStatus, setCampaignStatus] = useState(null);
   const [statusCheckErrors, setStatusCheckErrors] = useState(0);
+  const [userProfile, setUserProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+
+  // Load user profile data on component mount
+  useEffect(() => {
+    fetchUserProfile();
+  }, []);
 
   // Load campaign data if editing or cloning
   useEffect(() => {
@@ -97,6 +104,28 @@ const FormSubmitterPage = () => {
       }
     };
   }, [processingCampaignId, campaignStatus?.is_complete, statusCheckErrors, navigate]);
+
+  const fetchUserProfile = async () => {
+    try {
+      setProfileLoading(true);
+      const profile = await apiService.getUserProfile();
+      setUserProfile(profile);
+      
+      // Pre-populate form fields with user profile data
+      if (profile) {
+        setFormData(prev => ({
+          ...prev,
+          message_template: profile.message || prev.message_template,
+          fallback_email: profile.email || prev.fallback_email
+        }));
+      }
+    } catch (err) {
+      console.error('Error loading user profile:', err);
+      // Don't show error toast for profile loading as it's not critical
+    } finally {
+      setProfileLoading(false);
+    }
+  };
 
   const loadCampaignData = async (campaignId) => {
     try {
@@ -463,6 +492,71 @@ const FormSubmitterPage = () => {
               )}
             </div>
           </div>
+
+          {/* User Profile Information */}
+          {userProfile && (
+            <div className="bg-white rounded-xl shadow-sm p-6">
+              <div className="flex items-center gap-3 mb-6">
+                <User className="w-6 h-6 text-indigo-600" />
+                <h2 className="text-xl font-semibold text-gray-900">Your Profile Information</h2>
+                {profileLoading && (
+                  <div className="flex items-center gap-2 text-sm text-gray-500">
+                    <div className="w-4 h-4 border-2 border-gray-300 border-t-indigo-600 rounded-full animate-spin"></div>
+                    <span>Loading...</span>
+                  </div>
+                )}
+              </div>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-500">Name</label>
+                  <p className="text-sm text-gray-900">
+                    {userProfile.first_name} {userProfile.last_name}
+                  </p>
+                </div>
+                
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-gray-500">Email</label>
+                  <p className="text-sm text-gray-900">{userProfile.email}</p>
+                </div>
+                
+                {userProfile.company_name && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Company</label>
+                    <p className="text-sm text-gray-900">{userProfile.company_name}</p>
+                  </div>
+                )}
+                
+                {userProfile.job_title && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Job Title</label>
+                    <p className="text-sm text-gray-900">{userProfile.job_title}</p>
+                  </div>
+                )}
+                
+                {userProfile.phone_number && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Phone</label>
+                    <p className="text-sm text-gray-900">{userProfile.phone_number}</p>
+                  </div>
+                )}
+                
+                {userProfile.website_url && (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Website</label>
+                    <p className="text-sm text-gray-900">{userProfile.website_url}</p>
+                  </div>
+                )}
+              </div>
+              
+              <div className="mt-4 p-3 bg-blue-50 rounded-lg">
+                <p className="text-sm text-blue-800">
+                  <strong>Note:</strong> This information will be used to automatically fill contact forms when your campaign runs. 
+                  You can update your profile in the <a href="/profile" className="text-blue-600 hover:text-blue-800 underline">Profile Settings</a> page.
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Message Configuration */}
           <div className="bg-white rounded-xl shadow-sm p-6">
