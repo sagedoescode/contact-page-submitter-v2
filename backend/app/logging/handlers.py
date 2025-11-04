@@ -16,12 +16,11 @@ from datetime import datetime, timedelta
 
 # Import database utilities with fallback
 try:
-    from app.core.database import get_db
+    from app.core.database import SessionLocal
     from app.utils.logs import insert_app_log
 except ImportError:
     # Fallback if database modules not available
-    def get_db():
-        return None
+    SessionLocal = None
 
     def insert_app_log(*args, **kwargs):
         pass
@@ -394,11 +393,13 @@ class DatabaseHandler(logging.Handler):
 
         db = None
         try:
-            db = next(get_db()) if get_db else None
-            if not db:
-                print("Warning: Database connection not available for logging")
+            # Create a database session directly (avoiding generator issues)
+            if SessionLocal is None:
+                print("Warning: Database session factory not available for logging")
                 self._failed_logs += len(batch)
                 return
+            
+            db = SessionLocal()
 
             for record in batch:
                 try:

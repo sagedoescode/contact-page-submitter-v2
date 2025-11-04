@@ -545,6 +545,83 @@ def get_campaign(
         )
 
 
+@router.get("/{campaign_id}/submissions")
+@log_function("get_campaign_submissions")
+def get_campaign_submissions(
+    request: Request,
+    campaign_id: UUID,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get submissions for a campaign with error details"""
+    user_id_var.set(str(user.id))
+    campaign_id_var.set(str(campaign_id))
+    
+    try:
+        # Verify campaign ownership
+        campaign_check = db.execute(
+            text("SELECT id FROM campaigns WHERE id = :id AND user_id = :uid"),
+            {"id": str(campaign_id), "uid": str(user.id)}
+        ).first()
+        
+        if not campaign_check:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        
+        # Get submissions with pagination
+        offset = (page - 1) * limit
+        query = text("""
+            SELECT 
+                id, url, status, success, error_message, 
+                created_at, updated_at, retry_count,
+                captcha_encountered, captcha_solved
+            FROM submissions 
+            WHERE campaign_id = :campaign_id
+            ORDER BY created_at DESC
+            LIMIT :limit OFFSET :offset
+        """)
+        
+        submissions = db.execute(
+            query,
+            {"campaign_id": str(campaign_id), "limit": limit, "offset": offset}
+        ).mappings().all()
+        
+        # Get total count
+        count_query = text("SELECT COUNT(*) FROM submissions WHERE campaign_id = :campaign_id")
+        total = db.execute(count_query, {"campaign_id": str(campaign_id)}).scalar() or 0
+        
+        # Format results
+        result = []
+        for sub in submissions:
+            result.append({
+                "id": str(sub["id"]),
+                "url": sub.get("url"),
+                "status": sub.get("status"),
+                "success": sub.get("success"),
+                "error_message": sub.get("error_message"),
+                "created_at": sub["created_at"].isoformat() if sub.get("created_at") else None,
+                "updated_at": sub["updated_at"].isoformat() if sub.get("updated_at") else None,
+                "retry_count": sub.get("retry_count") or 0,
+                "captcha_encountered": sub.get("captcha_encountered"),
+                "captcha_solved": sub.get("captcha_solved"),
+            })
+        
+        return {
+            "data": result,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total + limit - 1) // limit
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting campaign submissions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get submissions: {str(e)}")
+
+
 @router.get("/{campaign_id}/status")
 @log_function("get_campaign_status")
 def get_campaign_status(

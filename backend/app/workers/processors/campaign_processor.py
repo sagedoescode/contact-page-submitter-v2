@@ -658,8 +658,11 @@ async def process_with_playwright(
                             logger.warning("  ✗ No form fields could be filled")
 
                     else:
+                        # No form found - log this clearly
+                        logger.warning("  ✗ No contact form found on page")
+                        logger.info("  Trying email extraction as fallback...")
+                        
                         # Try email extraction as fallback
-                        logger.info("No form found, trying email extraction...")
                         emails = await page.query_selector_all('a[href^="mailto:"]')
 
                         if emails:
@@ -709,9 +712,11 @@ async def process_with_playwright(
                         await asyncio.sleep(5)
 
                 except Exception as e:
-                    logger.error(f"  Error processing submission: {e}", exc_info=True)
+                    error_msg = str(e)
+                    logger.error(f"  ✗ Error processing submission {idx}/{len(submissions)}: {error_msg}", exc_info=True)
+                    logger.error(f"  URL: {submission['url']}")
                     failed += 1
-                    update_submission(db, submission["id"], "failed", str(e))
+                    update_submission(db, submission["id"], "failed", error_msg[:500])
 
             # Close browser
             await browser.close()

@@ -108,15 +108,35 @@ const FormSubmitterPage = () => {
   const fetchUserProfile = async () => {
     try {
       setProfileLoading(true);
-      const profile = await apiService.getUserProfile();
-      setUserProfile(profile);
+      const response = await apiService.getUserProfile();
+      
+      // API returns {user: {...}, profile: {...}}, merge them
+      const userData = response.user || {};
+      const profileData = response.profile || {};
+      
+      // Combine user and profile data into a single object
+      const mergedProfile = {
+        ...userData,
+        ...profileData,
+        // Ensure we have the email from user if not in profile
+        email: userData.email || profileData.email,
+        first_name: userData.first_name || profileData.first_name,
+        last_name: userData.last_name || profileData.last_name,
+      };
+      
+      setUserProfile(mergedProfile);
       
       // Pre-populate form fields with user profile data
-      if (profile) {
+      if (mergedProfile) {
+        // Get user's full name for placeholder
+        const fullName = [mergedProfile.first_name, mergedProfile.last_name]
+          .filter(Boolean)
+          .join(' ') || 'Your Name';
+        
         setFormData(prev => ({
           ...prev,
-          message_template: profile.message || prev.message_template,
-          fallback_email: profile.email || prev.fallback_email
+          message_template: mergedProfile.message || prev.message_template || `Hi {name},\n\nI wanted to reach out regarding {topic}...`,
+          fallback_email: mergedProfile.email || prev.fallback_email
         }));
       }
     } catch (err) {
@@ -494,7 +514,7 @@ const FormSubmitterPage = () => {
           </div>
 
           {/* User Profile Information */}
-          {userProfile && (
+          {(userProfile || profileLoading) && (
             <div className="bg-white rounded-xl shadow-sm p-6">
               <div className="flex items-center gap-3 mb-6">
                 <User className="w-6 h-6 text-indigo-600" />
@@ -507,47 +527,58 @@ const FormSubmitterPage = () => {
                 )}
               </div>
               
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-500">Name</label>
-                  <p className="text-sm text-gray-900">
-                    {userProfile.first_name} {userProfile.last_name}
-                  </p>
+              {profileLoading && !userProfile ? (
+                <div className="text-center py-8 text-gray-500">
+                  <div className="w-8 h-8 border-2 border-gray-300 border-t-indigo-600 rounded-full animate-spin mx-auto mb-2"></div>
+                  <p>Loading profile information...</p>
                 </div>
-                
-                <div className="space-y-2">
-                  <label className="text-sm font-medium text-gray-500">Email</label>
-                  <p className="text-sm text-gray-900">{userProfile.email}</p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Name</label>
+                    <p className="text-sm text-gray-900 font-medium">
+                      {userProfile 
+                        ? ([userProfile.first_name, userProfile.last_name].filter(Boolean).join(' ') || 'Not set')
+                        : 'Loading...'}
+                    </p>
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-gray-500">Email</label>
+                    <p className="text-sm text-gray-900 font-medium">
+                      {userProfile ? (userProfile.email || 'Not set') : 'Loading...'}
+                    </p>
+                  </div>
+                  
+                  {userProfile?.company_name && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-500">Company</label>
+                      <p className="text-sm text-gray-900">{userProfile.company_name}</p>
+                    </div>
+                  )}
+                  
+                  {userProfile?.job_title && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-500">Job Title</label>
+                      <p className="text-sm text-gray-900">{userProfile.job_title}</p>
+                    </div>
+                  )}
+                  
+                  {userProfile?.phone_number && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-500">Phone</label>
+                      <p className="text-sm text-gray-900">{userProfile.phone_number}</p>
+                    </div>
+                  )}
+                  
+                  {userProfile?.website_url && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium text-gray-500">Website</label>
+                      <p className="text-sm text-gray-900">{userProfile.website_url}</p>
+                    </div>
+                  )}
                 </div>
-                
-                {userProfile.company_name && (
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-500">Company</label>
-                    <p className="text-sm text-gray-900">{userProfile.company_name}</p>
-                  </div>
-                )}
-                
-                {userProfile.job_title && (
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-500">Job Title</label>
-                    <p className="text-sm text-gray-900">{userProfile.job_title}</p>
-                  </div>
-                )}
-                
-                {userProfile.phone_number && (
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-500">Phone</label>
-                    <p className="text-sm text-gray-900">{userProfile.phone_number}</p>
-                  </div>
-                )}
-                
-                {userProfile.website_url && (
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-gray-500">Website</label>
-                    <p className="text-sm text-gray-900">{userProfile.website_url}</p>
-                  </div>
-                )}
-              </div>
+              )}
               
               <div className="mt-4 p-3 bg-blue-50 rounded-lg">
                 <p className="text-sm text-blue-800">
@@ -575,7 +606,15 @@ const FormSubmitterPage = () => {
                   onChange={(e) => setFormData({...formData, message_template: e.target.value})}
                   className="w-full px-4 py-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors"
                   rows="6"
-                  placeholder="Hi {name},&#10;&#10;I wanted to reach out regarding {topic}..."
+                  placeholder={(() => {
+                    const fullName = userProfile 
+                      ? [userProfile.first_name, userProfile.last_name].filter(Boolean).join(' ') 
+                      : null;
+                    if (fullName) {
+                      return `Hi {name},\n\nI'm ${fullName} and I wanted to reach out regarding {topic}...`;
+                    }
+                    return `Hi {name},\n\nI wanted to reach out regarding {topic}...`;
+                  })()}
                   required
                 />
                 <p className="mt-1 text-xs text-gray-500">

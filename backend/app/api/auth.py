@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from functools import wraps
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status, Body
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, validator
 from sqlalchemy.orm import Session
@@ -36,6 +36,32 @@ from app.logging.core import user_id_var
 logger = get_logger(__name__)
 router = APIRouter(tags=["auth"], redirect_slashes=False)
 security = HTTPBearer()
+
+# Explicit OPTIONS handler for CORS preflight
+@router.options("/{full_path:path}")
+async def options_handler(full_path: str, request: Request):
+    """Handle CORS preflight OPTIONS requests"""
+    origin = request.headers.get("origin")
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    
+    headers = {
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "3600",
+    }
+    
+    if origin in allowed_origins:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+    
+    return Response(headers=headers)
 
 # Auth configuration
 ALLOW_UNVERIFIED_LOGIN = os.getenv("AUTH_ALLOW_UNVERIFIED", "true").lower() == "true"

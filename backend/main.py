@@ -64,6 +64,8 @@ def _parse_cors_origins() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
     ]
@@ -265,6 +267,7 @@ def register_routers(app: FastAPI) -> None:
 # ----------------------------
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
+    logger = get_logger("app.main")
 
     app = FastAPI(
         lifespan=lifespan,
@@ -276,25 +279,30 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    # Security middleware
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=["*"],  # Configure appropriately for production
-    )
-
-    # CORS middleware
+    # Request logging middleware (add first, runs last)
+    app.add_middleware(RequestLoggingMiddleware, logger_name="http")
+    
+    # CORS middleware - Add LAST so it runs FIRST (middleware executes in reverse order)
     allow_origins = _parse_cors_origins()
+    print(f"\n{'='*60}")
+    print(f"[CORS] Configuring CORS with allowed origins:")
+    for origin in allow_origins:
+        print(f"[CORS]   - {origin}")
+    print(f"{'='*60}\n")
+    logger.info(f"[CORS] Configuring CORS with allowed origins: {allow_origins}")
+    
+    # Add CORS middleware LAST so it processes requests FIRST
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allow_origins,
+        allow_origins=allow_origins,  # List of allowed origins
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["*"],  # Allow all methods
+        allow_headers=["*"],  # Allow all headers
         expose_headers=["*"],
+        max_age=3600,
     )
-
-    # Request logging middleware
-    app.add_middleware(RequestLoggingMiddleware, logger_name="http")
+    print("[CORS] ✅ CORS middleware configured successfully\n")
+    logger.info("[CORS] CORS middleware configured successfully")
 
     # Register all routers
     register_routers(app)
@@ -309,6 +317,23 @@ def create_app() -> FastAPI:
             "version": os.getenv("APP_VERSION", "2.0.0"),
             "timestamp": time.time(),
         }
+    
+    # CORS test endpoint
+    @app.options("/api/auth/login")
+    @app.options("/api/{path:path}")
+    async def cors_test(request: Request):
+        """Explicit CORS handler for testing"""
+        origin = request.headers.get("origin")
+        allow_origins = _parse_cors_origins()
+        headers = {
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+        if origin in allow_origins:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+        return Response(status_code=200, headers=headers)
 
     # Root endpoint with comprehensive information
     @app.get("/")

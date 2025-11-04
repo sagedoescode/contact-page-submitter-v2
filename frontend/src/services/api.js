@@ -1,7 +1,9 @@
 // src/services/api.js - Complete API Service with Fixed WebSocket
 import axios from 'axios';
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
+// Use proxy in development (avoids CORS), direct URL in production
+// When using proxy, requests go to /api which vite proxies to backend
+const BASE_URL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? '' : 'http://127.0.0.1:8000');
 
 class ApiService {
   constructor() {
@@ -151,6 +153,76 @@ class ApiService {
 
   async getCampaignStatus(campaignId) {
     return this.makeRequest('get', `/api/campaigns/${campaignId}/status`);
+  }
+
+  // Get websites for a campaign
+  async getWebsites(campaignId, params = {}) {
+    const queryParams = new URLSearchParams({
+      campaign_id: campaignId,
+      ...(params.page && { page: params.page }),
+      ...(params.limit && { page_size: params.limit }),
+      ...(params.status && { status_filter: params.status })
+    });
+    return this.makeRequest('get', `/api/websites?${queryParams}`);
+  }
+
+  // Get submissions for a campaign
+  async getSubmissions(campaignId, params = {}) {
+    const queryParams = new URLSearchParams({
+      ...(params.page && { page: params.page }),
+      ...(params.limit && { limit: params.limit }),
+      ...(params.status && { status: params.status })
+    });
+    // Use campaign-specific submissions endpoint
+    try {
+      const url = `/api/campaigns/${campaignId}/submissions${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
+      return await this.makeRequest('get', url);
+    } catch (error) {
+      console.warn('[API] Campaign submissions endpoint failed, trying fallback:', error);
+      // Fallback: return empty array
+      return {
+        data: [],
+        total: 0,
+        page: params.page || 1,
+        limit: params.limit || 20
+      };
+    }
+  }
+
+  // Get campaign activity/logs
+  async getCampaignActivity(campaignId, limit = 50) {
+    try {
+      const queryParams = new URLSearchParams({
+        campaign_id: campaignId,
+        limit: limit.toString()
+      });
+      return await this.makeRequest('get', `/api/activity?${queryParams}`);
+    } catch (error) {
+      // Fallback: return empty activity
+      console.warn('[API] Campaign activity endpoint not available, returning empty array');
+      return { data: [] };
+    }
+  }
+
+  // Get campaign analytics
+  async getCampaignAnalytics(campaignId, days = 7) {
+    try {
+      // Try campaign-specific analytics endpoint
+      return await this.makeRequest('get', `/api/campaigns/${campaignId}/analytics`, null, {
+        params: { days }
+      });
+    } catch (error) {
+      // Fallback: get from campaign status
+      console.warn('[API] Campaign analytics endpoint not available, using campaign status');
+      const status = await this.getCampaignStatus(campaignId);
+      return {
+        success_rate: status.total > 0 ? ((status.successful / status.total) * 100).toFixed(2) : 0,
+        total_submissions: status.total,
+        successful: status.successful,
+        failed: status.failed,
+        processed: status.processed
+      };
+    }
   }
 
   async startCampaignWithCSV(file, campaignData) {
