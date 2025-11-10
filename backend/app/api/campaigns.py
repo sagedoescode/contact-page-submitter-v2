@@ -6,7 +6,7 @@ import io
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from fastapi import (
     APIRouter,
@@ -32,6 +32,15 @@ from app.services.submission_service import SubmissionService
 from app.services.csv_parser_service import CSVParserService
 from app.logging import get_logger, log_function, log_exceptions
 from app.logging.core import request_id_var, user_id_var, campaign_id_var
+from app.models.campaign import CampaignStatus
+from app.schemas.campaign import (
+    CampaignActionRequest,
+    CampaignActionResponse,
+)
+from app.workers.processors.subprocess_runner import (
+    start_campaign_processing,
+    stop_processor,
+)
 
 # Initialize structured logger
 logger = get_logger(__name__)
@@ -690,6 +699,396 @@ def get_campaign_status(
             status_code=500, detail=f"Failed to get campaign status: {str(e)}"
         )
 
+
+@router.get("/{campaign_id}/analytics")
+@log_function("get_campaign_analytics")
+def get_campaign_analytics(
+    request: Request,
+    campaign_id: UUID,
+    days: int = Query(7, ge=1, le=90),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get aggregated analytics for a campaign."""
+    user_id_var.set(str(user.id))
+    campaign_id_var.set(str(campaign_id))
+
+    try:
+        # Verify campaign belongs to user
+        campaign_check = text(
+            """
+            SELECT id FROM campaigns
+            WHERE id = :campaign_id AND user_id = :user_id
+        """
+        )
+        exists = db.execute(
+            campaign_check,
+            {"campaign_id": str(campaign_id), "user_id": str(user.id)},
+        ).first()
+
+        if not exists:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        window_start = datetime.utcnow() - timedelta(days=days)
+
+        stats_query = text(
+            """
+            SELECT
+                COUNT(*)::int AS total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS successful,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END)::int AS processing,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)::int AS pending,
+                SUM(CASE WHEN status = 'retry' THEN 1 ELSE 0 END)::int AS retry
+            FROM submissions
+            WHERE campaign_id = :campaign_id
+              AND created_at >= :window_start
+        """
+        )
+
+        stats_row = (
+            db.execute(
+                stats_query,
+                {"campaign_id": str(campaign_id), "window_start": window_start},
+            )
+            .mappings()
+            .first()
+        ) or {}
+
+        total = stats_row.get("total", 0) or 0
+        successful = stats_row.get("successful", 0) or 0
+        failed = stats_row.get("failed", 0) or 0
+        processed = successful + failed
+        pending = stats_row.get("pending", 0) or 0
+        retry = stats_row.get("retry", 0) or 0
+
+        daily_query = text(
+            """
+            SELECT
+                DATE_TRUNC('day', COALESCE(processed_at, updated_at, created_at))::date AS day,
+                COUNT(*)::int AS total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS successful,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed
+            FROM submissions
+            WHERE campaign_id = :campaign_id
+              AND created_at >= :window_start
+            GROUP BY day
+            ORDER BY day
+        """
+        )
+
+        daily_rows = db.execute(
+            daily_query,
+            {"campaign_id": str(campaign_id), "window_start": window_start},
+        ).mappings()
+
+        daily_stats = [
+            {
+                "day": row["day"].isoformat(),
+                "total": row["total"],
+                "successful": row["successful"],
+                "failed": row["failed"],
+            }
+            for row in daily_rows
+        ]
+
+        success_rate = round((successful / max(processed, 1)) * 100, 2) if processed else 0.0
+
+        return {
+            "campaign_id": str(campaign_id),
+            "time_window_days": days,
+            "total_submissions": total,
+            "processed": processed,
+            "successful": successful,
+            "failed": failed,
+            "pending": pending,
+            "retry": retry,
+            "success_rate": success_rate,
+            "daily_stats": daily_stats,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Failed to get campaign analytics",
+            extra={
+                "event": "campaign_analytics_failed",
+                "campaign_id": str(campaign_id),
+                "user_id": str(user.id),
+                "error": str(e),
+            },
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to get campaign analytics")
+
+@router.post("/{campaign_id}/actions", response_model=CampaignActionResponse)
+@log_function("campaign_action")
+async def campaign_action(
+    request: Request,
+    campaign_id: UUID,
+    action_request: CampaignActionRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Perform campaign control actions (pause/resume/stop/cancel)."""
+    user_id_var.set(str(user.id))
+    campaign_id_var.set(str(campaign_id))
+
+    try:
+        logger.info(
+            "Campaign action requested",
+            extra={
+                "event": "campaign_action_requested",
+                "campaign_id": str(campaign_id),
+                "user_id": str(user.id),
+                "action": action_request.action,
+                "reason": action_request.reason,
+            },
+        )
+
+        query = text(
+            """
+            SELECT id, status FROM campaigns
+            WHERE id = :campaign_id AND user_id = :user_id
+        """
+        )
+        campaign = (
+            db.execute(
+                query, {"campaign_id": str(campaign_id), "user_id": str(user.id)}
+            )
+            .mappings()
+            .first()
+        )
+
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        old_status = campaign.get("status") or CampaignStatus.DRAFT.value
+        requested_action = action_request.action.lower()
+        warnings: List[str] = []
+        timestamp = datetime.utcnow()
+
+        def update_campaign_status(new_status: CampaignStatus, error_message: str = None):
+            db.execute(
+                text(
+                    """
+                    UPDATE campaigns
+                    SET status = :status,
+                        updated_at = :updated_at,
+                        error_message = :error_message
+                    WHERE id = :campaign_id
+                """
+                ),
+                {
+                    "status": new_status.value,
+                    "updated_at": timestamp,
+                    "error_message": error_message,
+                    "campaign_id": str(campaign_id),
+                },
+            )
+
+        def reset_processing_submissions(set_failed: bool = False, failure_reason: str = None):
+            if set_failed:
+                db.execute(
+                    text(
+                        """
+                        UPDATE submissions
+                        SET status = 'failed',
+                            error_message = :reason,
+                            updated_at = :updated_at
+                        WHERE campaign_id = :campaign_id
+                          AND status IN ('pending', 'processing')
+                    """
+                    ),
+                    {
+                        "reason": failure_reason or "Campaign stopped by user",
+                        "updated_at": timestamp,
+                        "campaign_id": str(campaign_id),
+                    },
+                )
+            else:
+                db.execute(
+                    text(
+                        """
+                        UPDATE submissions
+                        SET status = 'pending',
+                            updated_at = :updated_at
+                        WHERE campaign_id = :campaign_id
+                          AND status = 'processing'
+                    """
+                    ),
+                    {"updated_at": timestamp, "campaign_id": str(campaign_id)},
+                )
+
+        def commit_changes():
+            try:
+                db.commit()
+            except Exception as commit_error:
+                db.rollback()
+                raise commit_error
+
+        if requested_action == "pause":
+            if old_status not in [
+                CampaignStatus.RUNNING.value,
+                CampaignStatus.PROCESSING.value,
+                CampaignStatus.QUEUED.value,
+            ] and not action_request.force:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot pause campaign in status {old_status}",
+                )
+
+            update_campaign_status(CampaignStatus.PAUSED)
+            reset_processing_submissions(set_failed=False)
+            commit_changes()
+
+            stop_result = stop_processor(str(campaign_id))
+            if not stop_result.get("success", False):
+                warnings.append(stop_result.get("message", "Failed to pause worker"))
+
+            message = "Campaign paused successfully"
+            new_status = CampaignStatus.PAUSED.value
+
+        elif requested_action == "resume":
+            if old_status not in [
+                CampaignStatus.PAUSED.value,
+                CampaignStatus.STOPPED.value,
+            ]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot resume campaign in status {old_status}",
+                )
+
+            update_campaign_status(CampaignStatus.QUEUED)
+            commit_changes()
+
+            if not start_campaign_processing(str(campaign_id), str(user.id)):
+                warnings.append("Campaign processor failed to start")
+                update_campaign_status(
+                    CampaignStatus.FAILED, "Failed to resume campaign"
+                )
+                commit_changes()
+                raise HTTPException(
+                    status_code=500, detail="Failed to resume campaign processing"
+                )
+
+            message = "Campaign resumed successfully"
+            new_status = CampaignStatus.QUEUED.value
+
+        elif requested_action in {"stop", "cancel"}:
+            if old_status in [
+                CampaignStatus.COMPLETED.value,
+                CampaignStatus.FAILED.value,
+                CampaignStatus.CANCELLED.value,
+                CampaignStatus.STOPPED.value,
+            ] and not action_request.force:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Campaign already {old_status.lower()}",
+                )
+
+            target_status = (
+                CampaignStatus.CANCELLED
+                if requested_action == "cancel"
+                else CampaignStatus.STOPPED
+            )
+
+            update_campaign_status(target_status, action_request.reason)
+            reset_processing_submissions(
+                set_failed=True,
+                failure_reason=action_request.reason or "Campaign stopped by user",
+            )
+            commit_changes()
+
+            stop_result = stop_processor(str(campaign_id))
+            if not stop_result.get("success", False):
+                warnings.append(stop_result.get("message", "Failed to stop worker"))
+
+            message = (
+                "Campaign cancelled successfully"
+                if requested_action == "cancel"
+                else "Campaign stopped successfully"
+            )
+            new_status = target_status.value
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported campaign action")
+
+        logger.info(
+            "Campaign action completed",
+            extra={
+                "event": "campaign_action_completed",
+                "campaign_id": str(campaign_id),
+                "user_id": str(user.id),
+                "action": requested_action,
+                "old_status": old_status,
+                "new_status": new_status,
+                "warnings": warnings,
+            },
+        )
+
+        return CampaignActionResponse(
+            success=True,
+            message=message,
+            campaign_id=str(campaign_id),
+            old_status=old_status,
+            new_status=new_status,
+            warnings=warnings or None,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            "Campaign action failed",
+            extra={
+                "event": "campaign_action_failed",
+                "campaign_id": str(campaign_id),
+                "user_id": str(user.id),
+                "action": action_request.action,
+                "error": str(e),
+            },
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to perform campaign action")
+
+
+@router.post("/{campaign_id}/pause", response_model=CampaignActionResponse)
+async def pause_campaign(
+    request: Request,
+    campaign_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Alias endpoint for pausing a campaign."""
+    action_request = CampaignActionRequest(action="pause")
+    return await campaign_action(request, campaign_id, action_request, db, user)
+
+
+@router.post("/{campaign_id}/resume", response_model=CampaignActionResponse)
+async def resume_campaign(
+    request: Request,
+    campaign_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Alias endpoint for resuming a campaign."""
+    action_request = CampaignActionRequest(action="resume")
+    return await campaign_action(request, campaign_id, action_request, db, user)
+
+
+@router.post("/{campaign_id}/stop", response_model=CampaignActionResponse)
+async def stop_campaign(
+    request: Request,
+    campaign_id: UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Alias endpoint for stopping a campaign."""
+    action_request = CampaignActionRequest(action="stop")
+    return await campaign_action(request, campaign_id, action_request, db, user)
 
 @router.delete("/{campaign_id}")
 @log_function("delete_campaign")

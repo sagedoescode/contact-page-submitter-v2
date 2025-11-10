@@ -160,6 +160,45 @@ def _build_filters(
     return base_sql, params
 
 
+@router.get("")
+@log_function("get_activity_default")
+def activity_default(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    campaign_id: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Backwards-compatible activity endpoint."""
+    base_result = activity_stream(
+        request,
+        db=db,
+        current_user=current_user,
+        me=True,
+        user_id=None,
+        source=None,
+        level=None,
+        action=None,
+        status=None,
+        q=None,
+        date_from=None,
+        date_to=None,
+        page=1,
+        page_size=limit,
+    )
+
+    items = base_result.get("items", [])
+
+    if campaign_id:
+        campaign_id_str = str(campaign_id)
+        filtered = [item for item in items if item.get("campaign_id") == campaign_id_str]
+        items = filtered[:limit]
+
+    return {
+        "items": items,
+        "total": len(items),
+    }
+
 @router.get("/stream")
 @log_function("get_activity_stream")
 def activity_stream(

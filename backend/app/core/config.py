@@ -129,7 +129,7 @@ class Settings:
     # Captcha settings
     CAPTCHA_ENCRYPTION_KEY: str = field(
         default_factory=lambda: os.getenv(
-            "CAPTCHA_ENCRYPTION_KEY", "_SS_cW5eZXsJJwQBDoczH8Ujsptjo_s0G_w6QPhnaw8="
+            "CAPTCHA_ENCRYPTION_KEY", "ackvtc-ge9RXynxBAjoiuiyi8QpzcSCd5jHqZJY7IiI="
         )
     )
     CAPTCHA_DBC_API_URL: str = field(

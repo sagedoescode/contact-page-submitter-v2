@@ -3,10 +3,11 @@
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from playwright.async_api import Page
 from sqlalchemy.orm import Session
 
@@ -143,6 +144,107 @@ class DeathByCaptchaAPI:
             logger.error(f"CAPTCHA solving error: {e}")
             return None
 
+    async def solve_recaptcha_v2(
+        self,
+        site_key: str,
+        page_url: str,
+        proxy: Optional[Dict[str, str]] = None,
+        max_attempts: int = 60,
+        poll_interval: int = 5,
+    ) -> Optional[Tuple[str, str]]:
+        """Solve reCAPTCHA v2 using Death By Captcha token API."""
+        if not self.enabled:
+            logger.warning("DBC not enabled - cannot solve reCAPTCHA v2")
+            return None
+
+        try:
+            # Optional: ensure we have some balance
+            balance = await self.get_balance()
+            if balance < 0.05:
+                logger.error(f"Insufficient DBC balance for token solving: ${balance:.2f}")
+                return None
+
+            token_params = {
+                "googlekey": site_key,
+                "pageurl": page_url,
+            }
+
+            if proxy and proxy.get("url"):
+                token_params["proxy"] = proxy["url"]
+                token_params["proxytype"] = proxy.get("type", "HTTP").upper()
+
+            payload = {
+                "username": self.username,
+                "password": self.password,
+                "type": 4,  # Token-based captcha
+                "token_params": json.dumps(token_params),
+            }
+
+            logger.info("Submitting reCAPTCHA v2 token request to Death By Captcha")
+            response = requests.post(
+                f"{self.base_url}/captcha",
+                data=payload,
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                logger.error(
+                    "reCAPTCHA token submission failed: HTTP %s - %s",
+                    response.status_code,
+                    response.text,
+                )
+                return None
+
+            result = response.json()
+            captcha_id = result.get("captcha")
+
+            if not captcha_id:
+                logger.error("Death By Captcha did not return captcha ID for token request")
+                return None
+
+            logger.info(f"Death By Captcha token request accepted, ID: {captcha_id}")
+
+            for attempt in range(max_attempts):
+                await asyncio.sleep(poll_interval)
+                try:
+                    poll_response = requests.get(
+                        f"{self.base_url}/captcha/{captcha_id}",
+                        timeout=15,
+                    )
+
+                    if poll_response.status_code != 200:
+                        logger.warning(
+                            "Token poll failed (attempt %s): HTTP %s",
+                            attempt + 1,
+                            poll_response.status_code,
+                        )
+                        continue
+
+                    poll_result = poll_response.json()
+                    text = poll_result.get("text")
+
+                    if text:
+                        logger.info("reCAPTCHA token received from Death By Captcha")
+                        return captcha_id, text
+
+                    if poll_result.get("is_correct") is False:
+                        logger.error("Death By Captcha marked token as incorrect")
+                        break
+
+                except Exception as poll_error:
+                    logger.warning(
+                        "Error polling reCAPTCHA token (attempt %s): %s",
+                        attempt + 1,
+                        poll_error,
+                    )
+
+            logger.error("Timed out waiting for reCAPTCHA token from Death By Captcha")
+            return None
+
+        except Exception as e:
+            logger.error(f"reCAPTCHA solving error: {e}")
+            return None
+
     async def report_incorrect(self, captcha_id: str) -> bool:
         """Report incorrectly solved CAPTCHA for refund."""
         if not self.enabled:
@@ -186,8 +288,8 @@ class CaptchaService:
         else:
             # Fallback to environment variables for testing
             self.dbc = DeathByCaptchaAPI(
-                username=os.getenv("DBC_USERNAME", ""),
-                password=os.getenv("DBC_PASSWORD", ""),
+                username=os.getenv("DBC_USERNAME", "ScoopCPS"),
+                password=os.getenv("DBC_PASSWORD", "CowGoesThud@3030!"),
             )
 
         # CAPTCHA type detection patterns
@@ -323,9 +425,6 @@ class CaptchaService:
 
             # Handle other CAPTCHA types
             if detected_types.get("recaptcha_v2"):
-                self._log_warning(
-                    "reCAPTCHA v2 detected - manual intervention may be required"
-                )
                 return await self._handle_recaptcha_v2(page)
 
             if detected_types.get("hcaptcha"):
@@ -417,10 +516,79 @@ class CaptchaService:
     async def _handle_recaptcha_v2(self, page: Page) -> bool:
         """Handle reCAPTCHA v2."""
         try:
-            self._log_info("Waiting for reCAPTCHA v2 manual resolution...")
-            await asyncio.sleep(5)
+            self._log_info("Attempting to solve reCAPTCHA v2 via Death By Captcha")
 
-            # Check if reCAPTCHA token is present
+            site_key = await page.evaluate(
+                """
+                () => {
+                    const explicit = document.querySelector('[data-sitekey]');
+                    if (explicit && explicit.getAttribute("data-sitekey")) {
+                        return explicit.getAttribute("data-sitekey");
+                    }
+                    const iframe = document.querySelector('iframe[src*="recaptcha"]');
+                    if (iframe) {
+                        const src = iframe.getAttribute("src") || "";
+                        const match = src.match(/[?&]k=([^&]+)/);
+                        if (match && match[1]) {
+                            return decodeURIComponent(match[1]);
+                        }
+                    }
+                    return null;
+                }
+            """
+            )
+
+            if not site_key:
+                self._log_warning("Unable to extract reCAPTCHA site key")
+                return False
+
+            dbc_result = await self.dbc.solve_recaptcha_v2(
+                site_key=site_key,
+                page_url=page.url,
+            )
+
+            if not dbc_result:
+                self._log_error("Death By Captcha failed to provide reCAPTCHA token")
+                return False
+
+            captcha_id, token = dbc_result
+
+            # Inject token into page
+            await page.evaluate(
+                """
+                (token) => {
+                    const textarea = document.querySelector('[name="g-recaptcha-response"]');
+                    if (textarea) {
+                        textarea.value = token;
+                        textarea.dispatchEvent(new Event("change", { bubbles: true }));
+                    } else {
+                        const form = document.querySelector("form");
+                        if (form) {
+                            const hidden = document.createElement("textarea");
+                            hidden.name = "g-recaptcha-response";
+                            hidden.style.display = "none";
+                            hidden.value = token;
+                            form.appendChild(hidden);
+                        }
+                    }
+                    if (window.grecaptcha && window.grecaptcha.getResponse) {
+                        try {
+                            const widgets = window.grecaptcha.render ? window.grecaptcha.renderedIDs || [] : [];
+                            widgets.forEach((id) => {
+                                window.grecaptcha.setResponse(id, token);
+                            });
+                        } catch (err) {
+                            console.debug("Failed to set grecaptcha response", err);
+                        }
+                    }
+                }
+            """,
+                token,
+            )
+
+            await asyncio.sleep(1.5)
+
+            # Verify token presence
             token_check = await page.evaluate(
                 """
                 () => {
@@ -431,10 +599,15 @@ class CaptchaService:
             )
 
             if token_check:
-                self._log_info("reCAPTCHA appears to be solved")
+                self._log_info("reCAPTCHA v2 token successfully injected")
+                await self._log_captcha_success("recaptcha_v2")
                 return True
 
-            self._log_warning("reCAPTCHA not solved")
+            await self._log_captcha_failure(
+                "recaptcha_v2",
+                error="Token injection verification failed",
+            )
+            self._log_warning("reCAPTCHA token injection failed verification")
             return False
 
         except Exception as e:

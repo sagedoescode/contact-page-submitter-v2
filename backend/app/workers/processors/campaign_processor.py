@@ -12,6 +12,7 @@ from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
 
+from app.models.campaign import CampaignStatus
 # Load .env file
 load_dotenv()
 
@@ -136,6 +137,19 @@ def get_user_profile(db, user_id: str) -> Dict:
     }
 
 
+def fetch_campaign_status(db, campaign_id: str) -> Optional[str]:
+    """Fetch the latest campaign status from the database."""
+    try:
+        result = db.execute(
+            text("SELECT status FROM campaigns WHERE id = :id"),
+            {"id": campaign_id},
+        ).scalar()
+        return result
+    except Exception as e:
+        logger.warning(f"Could not fetch campaign status: {e}")
+        return None
+
+
 def process_campaign_submissions(campaign_id: str, user_id: str):
     """Main entry point - process all submissions for a campaign."""
     logger.info("=" * 70)
@@ -212,7 +226,7 @@ def process_campaign_submissions(campaign_id: str, user_id: str):
         asyncio.set_event_loop(loop)
 
         try:
-            successful, failed = loop.run_until_complete(
+            successful, failed, halt_status = loop.run_until_complete(
                 process_with_playwright(
                     db, submissions, campaign_id, user_profile, user_id
                 )
@@ -220,12 +234,25 @@ def process_campaign_submissions(campaign_id: str, user_id: str):
         finally:
             loop.close()
 
-        # Final update
-        final_status = "COMPLETED" if successful > 0 else "FAILED"
-        update_campaign(db, campaign_id, final_status, total, successful, failed)
+        processed_count = successful + failed
+
+        if halt_status:
+            final_status = halt_status
+        else:
+            if processed_count == total and failed == 0:
+                final_status = CampaignStatus.COMPLETED.value
+            elif processed_count == 0:
+                final_status = CampaignStatus.FAILED.value
+            else:
+                final_status = CampaignStatus.FAILED.value
+
+        update_campaign(db, campaign_id, final_status, processed_count, successful, failed)
 
         logger.info("=" * 70)
-        logger.info(f"COMPLETE: {successful}/{total} successful, {failed} failed")
+        logger.info(
+            f"RESULT ({final_status}): processed {processed_count}/{total}, "
+            f"{successful} successful, {failed} failed"
+        )
         logger.info("=" * 70)
 
     except Exception as e:
@@ -243,6 +270,7 @@ async def process_with_playwright(
 
     successful = 0
     failed = 0
+    halt_status = None
 
     try:
         # Import Playwright
@@ -275,6 +303,19 @@ async def process_with_playwright(
 
             # Process each submission
             for idx, submission in enumerate(submissions, 1):
+                # Check campaign status before processing each submission
+                current_status = fetch_campaign_status(db, campaign_id)
+                if current_status and current_status.upper() in [
+                    CampaignStatus.PAUSED.value,
+                    CampaignStatus.STOPPED.value,
+                    CampaignStatus.CANCELLED.value,
+                ]:
+                    halt_status = current_status.upper()
+                    logger.info(
+                        f"Campaign status is {halt_status}. Halting further processing."
+                    )
+                    break
+
                 try:
                     logger.info(f"\n{'='*50}")
                     logger.info(
@@ -743,7 +784,7 @@ async def process_with_playwright(
         for submission in submissions:
             update_submission(db, submission["id"], "failed", str(e))
 
-    return successful, failed
+    return successful, failed, halt_status
 
 
 def update_submission(
